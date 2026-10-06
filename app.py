@@ -1,0 +1,973 @@
+import streamlit as st
+import pandas as pd
+import io
+import time
+from pathlib import Path
+import tomllib
+from supabase import create_client, Client
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.enums import TA_CENTER
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+
+def get_supabase_client() -> Client:
+    """Initialize and return the Supabase client."""
+    url, key = _read_supabase_secrets()
+    if not url or not key:
+        raise ValueError("Supabase URL or Key is missing from configuration/secrets.")
+    return create_client(url, key)
+st.set_page_config(page_title="Oriental Consultants Philippines Inc.", page_icon="OCP", layout="wide")
+
+USERNAME = "admin"
+PASSWORD = "ocg123"
+
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+if "login_loading" not in st.session_state:
+    st.session_state.login_loading = False
+if "uploaded_df" not in st.session_state:
+    st.session_state.uploaded_df = None
+if "uploaded_name" not in st.session_state:
+    st.session_state.uploaded_name = None
+if "supabase_ready" not in st.session_state:
+    st.session_state.supabase_ready = False
+
+st.markdown("""
+<style>
+html, body, [class*="css"] {font-family: Inter, Arial, sans-serif;}
+.stApp {background:#f4f7fb;}
+.block-container {padding-top:2.2rem; padding-bottom:3rem; max-width:1700px;}
+
+.portal-header {
+    background:#fff;
+    border:1px solid #dfe6ee;
+    border-radius:20px;
+    padding:26px 28px;
+    box-shadow:0 6px 20px rgba(20,45,75,.04);
+    margin-bottom:22px;
+}
+.header-left {display:flex;align-items:center;gap:17px;}
+.ocp-square {
+    width:58px;height:58px;border-radius:15px;background:#124d7d;color:#fff;
+    display:flex;align-items:center;justify-content:center;font-weight:800;
+    font-size:19px;letter-spacing:.5px;
+}
+.header-title {font-size:23px;font-weight:800;color:#092e50;line-height:1.15;}
+.header-sub {font-size:15px;color:#68788a;margin-top:8px;}
+.portal-pill {
+    display:inline-block;background:#eef7ff;border:1px solid #d4e6f5;color:#0c4a78;
+    border-radius:999px;padding:12px 18px;font-weight:700;font-size:14px;
+}
+.section-title {font-size:20px;font-weight:800;color:#092e50;margin-top:14px;}
+.section-sub {color:#68788a;font-size:14px;margin-top:5px;margin-bottom:14px;}
+.signed-in {color:#77808d;font-size:15px;margin:7px 0 24px 0;}
+
+div[data-testid="stSelectbox"] [data-baseweb="select"] > div,
+div[data-testid="stTextInput"] [data-baseweb="input"] {
+    background:#f0f3f7;border-color:#e5eaf0;border-radius:10px;min-height:49px;
+}
+.stButton > button, .stDownloadButton > button {
+    min-height:48px;border-radius:10px;font-weight:700;
+}
+div[data-testid="stDataFrame"] {border-radius:12px;overflow:hidden;}
+
+/* Login */
+.login-wrap {max-width:500px;margin:5vh auto 18px;text-align:center;}
+.login-logo {
+    width:66px;height:66px;border-radius:16px;background:#124d7d;color:white;
+    margin:0 auto 14px;display:flex;align-items:center;justify-content:center;
+    font-weight:800;font-size:20px;
+}
+.login-title {font-size:27px;font-weight:800;color:#092e50;}
+.login-sub {color:#68788a;margin-top:5px;}
+div[data-testid="stForm"] {
+    max-width:500px;margin:0 auto;background:#fff;border:1px solid #e0e7ef;
+    border-radius:17px;padding:26px 28px;box-shadow:0 10px 30px rgba(20,45,75,.07);
+}
+
+/* Dialog */
+div[role="dialog"] {border-radius:18px;}
+
+/* Transparent Streamlit top navigation/header */
+[data-testid="stHeader"] {
+    background: transparent !important;
+}
+[data-testid="stToolbar"] {
+    background: transparent !important;
+}
+[data-testid="stDecoration"] {
+    display: none !important;
+}
+
+/* Single OCP portal header card */
+.ocp-portal-header {
+    background:#ffffff;
+    border:1px solid #dfe6ee;
+    border-radius:20px;
+    padding:26px 28px;
+    box-shadow:0 6px 20px rgba(20,45,75,.04);
+    margin-bottom:22px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:24px;
+}
+.ocp-header-left {
+    display:flex;
+    align-items:center;
+    gap:17px;
+}
+.ocp-header-logo {
+    width:58px;
+    height:58px;
+    border-radius:15px;
+    background:#124d7d;
+    color:#ffffff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:18px;
+    font-weight:800;
+    letter-spacing:.4px;
+    flex:0 0 auto;
+}
+.ocp-header-title {
+    color:#092e50;
+    font-size:23px;
+    font-weight:800;
+    line-height:1.15;
+}
+.ocp-header-subtitle {
+    color:#68788a;
+    font-size:15px;
+    margin-top:8px;
+}
+.ocp-portal-pill {
+    background:#eef7ff;
+    border:1px solid #d4e6f5;
+    color:#0c4a78;
+    border-radius:999px;
+    padding:13px 19px;
+    font-weight:700;
+    font-size:14px;
+    white-space:nowrap;
+}
+.login-loading {
+    max-width:480px;
+    margin:18vh auto 0;
+    text-align:center;
+}
+.login-loading-logo {
+    width:72px;
+    height:72px;
+    border-radius:18px;
+    margin:0 auto 18px;
+    background:#124d7d;
+    color:#fff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:20px;
+    font-weight:800;
+    box-shadow:0 10px 25px rgba(18,77,125,.18);
+}
+.login-loading-title {
+    font-size:25px;
+    font-weight:800;
+    color:#092e50;
+}
+.login-loading-text {
+    color:#68788a;
+    margin-top:7px;
+    font-size:15px;
+}
+@media(max-width:700px){
+    .ocp-portal-header{align-items:flex-start;flex-direction:column;}
+    .ocp-portal-pill{align-self:flex-start;}
+}
+
+/* Compact portal spacing */
+.block-container {
+    padding-top: 1.05rem !important;
+    padding-bottom: 1.6rem !important;
+}
+.ocp-portal-header {
+    padding: 18px 22px !important;
+    margin-bottom: 10px !important;
+    border-radius: 16px !important;
+}
+.ocp-header-logo {
+    width: 50px !important;
+    height: 50px !important;
+    border-radius: 13px !important;
+}
+.ocp-header-title {font-size:20px !important;}
+.ocp-header-subtitle {margin-top:5px !important;font-size:13px !important;}
+.ocp-portal-pill {padding:10px 16px !important;font-size:12px !important;}
+.signed-in {
+    margin: 2px 0 5px 0 !important;
+    font-size: 13px !important;
+}
+.section-title {
+    margin-top: 8px !important;
+    font-size: 18px !important;
+}
+.section-sub {
+    margin-top: 2px !important;
+    margin-bottom: 7px !important;
+    font-size: 13px !important;
+}
+div[data-testid="stVerticalBlock"] {gap:.55rem;}
+div[data-testid="stSelectbox"], div[data-testid="stTextInput"] {margin-bottom:0 !important;}
+.stButton > button, .stDownloadButton > button {
+    min-height: 42px !important;
+}
+div[data-testid="stDataFrame"] {margin-top:2px !important;}
+
+/* Modern floating login loading modal */
+.login-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 999998;
+    background: rgba(238, 243, 249, .70);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+.login-modal-card {
+    position: fixed;
+    z-index: 999999;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: min(390px, calc(100vw - 40px));
+    background: rgba(255,255,255,.96);
+    border: 1px solid rgba(216,225,235,.95);
+    border-radius: 22px;
+    padding: 30px 30px 28px;
+    text-align: center;
+    box-shadow: 0 24px 70px rgba(20, 45, 75, .18);
+}
+.login-modal-mark {
+    width: 58px;
+    height: 58px;
+    margin: 0 auto 17px;
+    border-radius: 16px;
+    background: #124d7d;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 17px;
+    font-weight: 800;
+    letter-spacing: .4px;
+    box-shadow: 0 9px 22px rgba(18,77,125,.18);
+}
+.login-modal-spinner {
+    width: 34px;
+    height: 34px;
+    margin: 0 auto 16px;
+    border: 3px solid #dbe8f2;
+    border-top-color: #17649c;
+    border-radius: 50%;
+    animation: ocpSpin .8s linear infinite;
+}
+@keyframes ocpSpin {
+    to { transform: rotate(360deg); }
+}
+.login-modal-title {
+    color: #092e50;
+    font-size: 20px;
+    font-weight: 800;
+    margin-bottom: 5px;
+}
+.login-modal-text {
+    color: #718096;
+    font-size: 13px;
+}
+
+/* ===== CLASSIC LAYOUT RESTORED ===== */
+.classic-ocp-header{
+    width:100%;
+    box-sizing:border-box;
+    background:#ffffff;
+    border:1px solid #dfe6ee;
+    border-radius:20px;
+    padding:18px 28px;
+    min-height:112px;
+    display:flex;
+    align-items:center;
+    justify-content:space-between;
+    gap:24px;
+    box-shadow:0 6px 20px rgba(20,45,75,.04);
+    margin-bottom:14px;
+}
+.classic-ocp-brand{
+    display:flex;
+    align-items:center;
+    gap:17px;
+}
+.classic-ocp-logo{
+    width:58px;
+    height:58px;
+    flex:0 0 58px;
+    border-radius:15px;
+    background:#124d7d;
+    color:#fff;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:18px;
+    font-weight:800;
+}
+.classic-ocp-title{
+    color:#092e50;
+    font-size:22px;
+    font-weight:800;
+    line-height:1.15;
+}
+.classic-ocp-subtitle{
+    color:#68788a;
+    font-size:14px;
+    margin-top:7px;
+}
+.classic-portal-pill{
+    min-width:205px;
+    min-height:42px;
+    box-sizing:border-box;
+    border-radius:999px;
+    border:1px solid #d4e6f5;
+    background:#eef7ff;
+    color:#0c4a78;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    padding:9px 18px;
+    font-size:12px;
+    font-weight:700;
+    white-space:nowrap;
+}
+
+/* Admin replaces the old dark-blue Log Out button */
+div[data-testid="stHorizontalBlock"]:has(div[data-testid="stPopover"]){
+    position:static !important;
+    height:auto !important;
+    min-height:auto !important;
+    margin:0 0 8px 0 !important;
+    padding:0 !important;
+    overflow:visible !important;
+}
+div[data-testid="stHorizontalBlock"]:has(div[data-testid="stPopover"]) > div:last-child{
+    position:static !important;
+    width:auto !important;
+    right:auto !important;
+    bottom:auto !important;
+}
+div[data-testid="stPopover"]{
+    display:block !important;
+    width:100% !important;
+}
+div[data-testid="stPopover"] > button{
+    position:static !important;
+    opacity:1 !important;
+    visibility:visible !important;
+    width:100% !important;
+    min-height:54px !important;
+    height:54px !important;
+    border-radius:12px !important;
+    border:1px solid #124d7d !important;
+    background:#124d7d !important;
+    color:#ffffff !important;
+    font-size:14px !important;
+    font-weight:700 !important;
+    box-shadow:none !important;
+}
+div[data-testid="stPopover"] > button:hover{
+    background:#0d416c !important;
+    border-color:#0d416c !important;
+}
+div[data-testid="stPopoverBody"]{
+    background:#ffffff !important;
+    border:1px solid #dfe6ee !important;
+    border-radius:14px !important;
+    box-shadow:0 16px 38px rgba(20,45,75,.16) !important;
+    padding:8px !important;
+}
+div[data-testid="stPopoverBody"] .stButton > button{
+    width:100% !important;
+    min-height:42px !important;
+    border-radius:9px !important;
+    font-weight:600 !important;
+}
+
+/* Hide only obsolete experimental header elements. */
+.ocp-admin-pill,
+.ocp-restored-admin-visual,
+.final-header,
+.modern-brand,
+.ocp-clean-brand{
+    display:none !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ============================================================
+# FILE UPLOAD / STAFF DATABASE
+# ============================================================
+
+def normalize_columns(df):
+    """Normalize common column names from OCP Excel/CSV files."""
+    df = df.copy()
+    aliases = {
+        "NAME": "Name",
+        "EMPLOYEE NAME": "Name",
+        "FULL NAME": "Name",
+        "PERSONNEL NAME": "Name",
+        "POSITION": "Position",
+        "DESIGNATION": "Position",
+        "JOB TITLE": "Position",
+        "TYPE OF ENGAGEMENT": "Type of Engagement",
+        "ENGAGEMENT": "Type of Engagement",
+        "EMPLOYMENT TYPE": "Type of Engagement",
+        "EVALUATION": "Evaluation",
+        "RATING": "Evaluation",
+        "PERFORMANCE": "Evaluation",
+        "STATUS": "Status",
+        "PROJECT": "Project",
+        "PROJECT NAME": "Project",
+    }
+    renamed = {}
+    for col in df.columns:
+        key = str(col).strip().upper()
+        if key in aliases:
+            renamed[col] = aliases[key]
+    df = df.rename(columns=renamed)
+    return df
+
+
+def enrich_staff_fields(df):
+    """Fill common engagement/evaluation fields when source files use alternate columns."""
+    df = df.copy()
+    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"]:
+        if col not in df.columns:
+            df[col] = ""
+
+    engagement_candidates = [
+        c for c in df.columns
+        if c != "Type of Engagement" and (
+            "ENGAGEMENT" in str(c).upper()
+            or "EMPLOYMENT TYPE" in str(c).upper()
+            or "CONTRACT TYPE" in str(c).upper()
+        )
+    ]
+    evaluation_candidates = [
+        c for c in df.columns
+        if c != "Evaluation" and (
+            "EVALUATION" in str(c).upper()
+            or "RATING" in str(c).upper()
+            or "PERFORMANCE" in str(c).upper()
+        )
+    ]
+
+    for c in engagement_candidates:
+        vals = df[c].fillna("").astype(str).str.strip()
+        blank = df["Type of Engagement"].fillna("").astype(str).str.strip().isin(["", "nan", "None"])
+        df.loc[blank & vals.ne("") & vals.ne("nan"), "Type of Engagement"] = vals
+
+    for c in evaluation_candidates:
+        vals = df[c].fillna("").astype(str).str.strip()
+        blank = df["Evaluation"].fillna("").astype(str).str.strip().isin(["", "nan", "None"])
+        df.loc[blank & vals.ne("") & vals.ne("nan"), "Evaluation"] = vals
+
+    return df
+
+
+def find_header(raw):
+    """Find the header row in an OCP worksheet."""
+    for i in range(min(len(raw), 25)):
+        vals = [str(v).strip().upper() for v in raw.iloc[i].tolist() if pd.notna(v)]
+        joined = " | ".join(vals)
+        if "NAME" in joined and ("POSITION" in joined or "DESIGNATION" in joined):
+            return i
+    return 0
+
+
+def load_upload(uploaded):
+    """Read an uploaded CSV or all worksheets in an uploaded Excel workbook."""
+    suffix = Path(uploaded.name).suffix.lower()
+
+    if suffix == ".csv":
+        uploaded.seek(0)
+        df = pd.read_csv(uploaded)
+        df = enrich_staff_fields(normalize_columns(df))
+        if "Project" not in df.columns:
+            df["Project"] = Path(uploaded.name).stem
+        return df
+
+    frames = []
+    uploaded.seek(0)
+    xls = pd.ExcelFile(uploaded)
+
+    for sheet in xls.sheet_names:
+        try:
+            uploaded.seek(0)
+            raw = pd.read_excel(uploaded, sheet_name=sheet, header=None)
+            header_row = find_header(raw)
+            uploaded.seek(0)
+            df = pd.read_excel(uploaded, sheet_name=sheet, header=header_row)
+            df = normalize_columns(df)
+            df = enrich_staff_fields(df)
+
+            if "Project" not in df.columns or df["Project"].fillna("").astype(str).str.strip().eq("").all():
+                df["Project"] = sheet.strip()
+
+            df = df.dropna(how="all")
+            frames.append(df)
+        except Exception:
+            continue
+
+    return pd.concat(frames, ignore_index=True, sort=False) if frames else pd.DataFrame()
+
+
+def clean_staff(df):
+    """Normalize staff fields while preserving meaningful rows."""
+    if df is None or df.empty:
+        return pd.DataFrame(columns=[
+            "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"
+        ])
+
+    df = df.copy()
+    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"]:
+        if col not in df.columns:
+            df[col] = ""
+        df[col] = df[col].fillna("").astype(str).str.strip()
+        df.loc[df[col].str.lower().isin(["nan", "none"]), col] = ""
+
+    useful = (df["Name"] != "") | (df["Position"] != "")
+    return df[useful].copy()
+
+
+def _read_supabase_secrets():
+    """Read Supabase credentials from Streamlit secrets.
+
+    Supported formats:
+      [supabase]
+      url = "..."
+      secret_key = "sb_secret_..."
+
+    and the existing project format:
+      [connections.postgres]
+      url = "..."
+      secret_key = "sb_secret_..."
+
+    A legacy JWT `key` is also accepted, but `secret_key` is preferred.
+    """
+    try:
+        # Preferred format
+        if "supabase" in st.secrets:
+            cfg = st.secrets["supabase"]
+            url = cfg.get("url") or cfg.get("URL")
+            key = cfg.get("secret_key") or cfg.get("key")
+            if url and key:
+                return str(url).strip(), str(key).strip()
+
+        # Support the user's existing [connections.postgres] section.
+        if "connections" in st.secrets and "postgres" in st.secrets["connections"]:
+            cfg = st.secrets["connections"]["postgres"]
+            url = cfg.get("url")
+            key = cfg.get("secret_key") or cfg.get("key")
+            if url and key:
+                return str(url).strip(), str(key).strip()
+
+        # Flat environment-style secrets
+        url = st.secrets.get("SUPABASE_URL")
+        key = st.secrets.get("SUPABASE_SECRET_KEY") or st.secrets.get("SUPABASE_KEY")
+        if url and key:
+            return str(url).strip(), str(key).strip()
+    except Exception:
+        pass
+
+    return None, None
+
+def fetch_staff_from_supabase():
+    """Load the staff records currently stored in Supabase."""
+    empty = pd.DataFrame(columns=[
+        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project",
+        "Source File", "Source Path", "Uploaded At"
+    ])
+    client = get_supabase_client()
+    if client is None:
+        return empty
+
+    try:
+        rows = []
+        start = 0
+        page_size = 1000
+        while True:
+            result = (
+                client.table("staff_records")
+                .select("name,position,type_of_engagement,evaluation,status,project,source_file,source_path,uploaded_at")
+                .range(start, start + page_size - 1)
+                .execute()
+            )
+            batch = result.data or []
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            start += page_size
+
+        if not rows:
+            return empty
+
+        df = pd.DataFrame(rows).rename(columns={
+            "name": "Name",
+            "position": "Position",
+            "type_of_engagement": "Type of Engagement",
+            "evaluation": "Evaluation",
+            "status": "Status",
+            "project": "Project",
+            "source_file": "Source File",
+            "source_path": "Source Path",
+            "uploaded_at": "Uploaded At",
+        })
+        return clean_staff(df)
+    except Exception as exc:
+        st.session_state.supabase_error = str(exc)
+        return empty
+
+
+def upload_staff_to_supabase(uploaded, parsed_df):
+    """Store the original file in Supabase Storage and its rows in PostgreSQL."""
+    client = get_supabase_client()
+    if client is None:
+        raise RuntimeError("Supabase is not configured. Check .streamlit/secrets.toml and make sure it contains your Supabase URL and Key.")
+
+    file_bytes = uploaded.getvalue()
+    filename = uploaded.name
+    safe_name = Path(filename).name.replace(" ", "_")
+    timestamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
+    storage_path = f"staff/{timestamp}_{safe_name}"
+
+    content_type = "text/csv" if filename.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    client.storage.from_("ocp-staff-files").upload(
+        storage_path,
+        file_bytes,
+        {"content-type": content_type, "upsert": "false"}
+    )
+
+    records = parsed_df[["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"]].copy()
+    records = records.fillna("").astype(str)
+    records["source_file"] = filename
+    records["source_path"] = storage_path
+    records["uploaded_at"] = pd.Timestamp.utcnow().isoformat()
+
+    # Replace records previously uploaded from the same source filename.
+    client.table("staff_records").delete().eq("source_file", filename).execute()
+
+    payload = records.rename(columns={
+        "Name": "name",
+        "Position": "position",
+        "Type of Engagement": "type_of_engagement",
+        "Evaluation": "evaluation",
+        "Status": "status",
+        "Project": "project",
+    }).to_dict(orient="records")
+
+    batch_size = 500
+    for i in range(0, len(payload), batch_size):
+        client.table("staff_records").insert(payload[i:i + batch_size]).execute()
+
+    return storage_path, len(payload)
+
+
+def make_pdf(df, project, status, position, engagement, evaluation, search):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
+                            rightMargin=28, leftMargin=28, topMargin=28, bottomMargin=28)
+    styles = getSampleStyleSheet()
+    styles["Title"].alignment = TA_CENTER
+    story = [
+        Paragraph("Oriental Consultants Philippines Inc.", styles["Title"]),
+        Paragraph("Filtered Staff List", styles["Heading2"]), Spacer(1, 8),
+        Paragraph(
+            f"<b>Project:</b> {project} &nbsp; | &nbsp; <b>Status:</b> {status} &nbsp; | &nbsp; "
+            f"<b>Name:</b> {search or 'All'} &nbsp; | &nbsp; <b>Position:</b> {position}<br/>"
+            f"<b>Type of Engagement:</b> {engagement} &nbsp; | &nbsp; "
+            f"<b>Evaluation:</b> {evaluation} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
+            styles["BodyText"]
+        ), Spacer(1, 14)
+    ]
+    cols = ["Name", "Position", "Type of Engagement", "Evaluation", "Status"]
+    data = [[Paragraph(f"<b>{c}</b>", styles["BodyText"]) for c in cols]]
+    for _, r in df[cols].fillna("").iterrows():
+        data.append([Paragraph(str(r[c]), styles["BodyText"]) for c in cols])
+    t = Table(data, repeatRows=1, colWidths=[160, 200, 135, 105, 100])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9EEF5")),
+        ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#D5DAE3")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(t)
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+# Login loading transition shown as a floating modal over the login page
+if st.session_state.login_loading and not st.session_state.logged_in:
+    # Keep the login page visually present behind the modal.
+    st.markdown("""
+    <div class="login-wrap">
+      <div class="login-logo">OCP</div>
+      <div class="login-title">Oriental Consultants Philippines Inc.</div>
+      <div class="login-sub">Employee Database Monitoring</div>
+    </div>
+    """, unsafe_allow_html=True)
+    with st.form("login_loading_background"):
+        st.text_input("Username", value="admin", disabled=True)
+        st.text_input("Password", value="••••••••", disabled=True)
+        st.form_submit_button("Log In", use_container_width=True, disabled=True)
+
+    st.markdown("""
+    <div class="login-modal-backdrop"></div>
+    <div class="login-modal-card">
+        <div class="login-modal-mark">OCP</div>
+        <div class="login-modal-spinner"></div>
+        <div class="login-modal-title">Signing you in...</div>
+        <div class="login-modal-text">Preparing your Personnel Selection Portal</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    time.sleep(1.15)
+    st.session_state.logged_in = True
+    st.session_state.login_loading = False
+    st.rerun()
+
+# Login
+if not st.session_state.logged_in:
+    st.markdown("""
+    <div class="login-wrap">
+      <div class="login-logo">OCP</div>
+      <div class="login-title">Oriental Consultants Philippines Inc.</div>
+      <div class="login-sub">Employee Database Monitoring</div>
+    </div>
+    """, unsafe_allow_html=True)
+    with st.form("login_form"):
+        username = st.text_input("Username", placeholder="Enter username")
+        password = st.text_input("Password", type="password", placeholder="Enter password")
+        go = st.form_submit_button("Log In", type="primary", use_container_width=True)
+        if go:
+            if username == USERNAME and password == PASSWORD:
+                st.session_state.login_loading = True
+                st.rerun()
+            else:
+                st.error("Incorrect username or password.")
+    st.stop()
+
+
+
+# ============================================================
+# CURRENT STAFF DATABASE - LOADED FROM SUPABASE
+# ============================================================
+
+active_df = fetch_staff_from_supabase()
+
+
+# Classic OCP header layout
+st.markdown("""
+<div class="classic-ocp-header">
+    <div class="classic-ocp-brand">
+        <div class="classic-ocp-logo">OCP</div>
+        <div>
+            <div class="classic-ocp-title">Oriental Consultants Philippines Inc.</div>
+            <div class="classic-ocp-subtitle">Employee Database Monitoring</div>
+        </div>
+    </div>
+    <div class="classic-portal-pill">Personnel Selection Portal</div>
+</div>
+""", unsafe_allow_html=True)
+
+# Admin menu - upload staff file and logout.
+_admin_space, _admin_col = st.columns([5, 1])
+with _admin_col:
+    with st.popover("Admin  ▾", use_container_width=True):
+        st.markdown("**Staff Database**")
+        st.caption("Upload an Excel or CSV file to Supabase. The dashboard reads the saved records from Supabase.")
+
+        uploaded = st.file_uploader(
+            "Upload Staff Database",
+            type=["xlsx", "csv"],
+            key="staff_database_upload",
+            help="The original file is stored in Supabase Storage and its records are saved in the Supabase database."
+        )
+
+        if uploaded is not None:
+            try:
+                preview = clean_staff(load_upload(uploaded))
+                if preview.empty:
+                    st.error("No usable staff records were found in this file.")
+                else:
+                    st.info(f"Ready to upload: {uploaded.name}")
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("Records", f"{len(preview):,}")
+                    m2.metric("Projects", f"{preview['Project'].replace('', pd.NA).dropna().nunique():,}")
+                    m3.metric("Statuses", f"{preview['Status'].replace('', pd.NA).dropna().nunique():,}")
+
+                    if st.button("Upload File to Supabase", type="primary", use_container_width=True):
+                        with st.spinner("Uploading file and saving records to Supabase..."):
+                            try:
+                                storage_path, count = upload_staff_to_supabase(uploaded, preview)
+                                st.session_state.uploaded_name = uploaded.name
+                                st.session_state.uploaded_df = None
+                                st.success(f"Uploaded to Supabase successfully: {count:,} staff records saved.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Supabase upload failed: {e}")
+            except Exception as e:
+                st.error(f"Unable to read file: {e}")
+
+        if st.session_state.uploaded_name:
+            st.divider()
+            st.caption(f"Latest uploaded file: **{st.session_state.uploaded_name}**")
+
+        st.divider()
+        if st.button("Log Out", key="classic_logout", use_container_width=True):
+            st.session_state.logged_in = False
+            st.session_state.login_loading = False
+            st.rerun()
+
+if active_df.empty:
+    st.info("No staff records are stored in Supabase. Open **Admin ▾** and upload an Excel or CSV file.")
+
+
+st.caption(
+    (f"Supabase file: {st.session_state.uploaded_name} · " if st.session_state.uploaded_name else "Supabase database · ")
+    + f"Database records: {len(active_df):,}"
+    + (f" across {active_df['Project'].nunique():,} projects." if not active_df.empty and "Project" in active_df.columns else ".")
+)
+
+st.markdown('<div class="section-title">Project Selection</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-sub">Select the project and project status you want to review.</div>', unsafe_allow_html=True)
+
+p1, p2 = st.columns(2)
+if "Project" in active_df.columns and not active_df.empty:
+    projects = sorted(x for x in active_df["Project"].unique() if x and str(x).lower() != "nan")
+else:
+    projects = []
+
+with p1:
+    project = st.selectbox("Project", ["All Projects"] + projects)
+
+if "Project" in active_df.columns and project != "All Projects":
+    project_df = active_df[active_df["Project"] == project]
+else:
+    project_df = active_df.copy()
+
+if "Status" in project_df.columns and not project_df.empty:
+    statuses = sorted(x for x in project_df["Status"].unique() if x and str(x).lower() != "nan")
+else:
+    statuses = []
+
+with p2:
+    status = st.selectbox("Status", ["All Status"] + statuses)
+
+filtered = project_df.copy()
+if "Status" in filtered.columns and status != "All Status":
+    filtered = filtered[filtered["Status"] == status]
+
+st.markdown('<div class="section-title" style="margin-top:12px">Staff Search & Filters</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-sub">Choose any filter below. The staff list updates automatically.</div>', unsafe_allow_html=True)
+
+c1, c2, c3, c4 = st.columns([1.35, 1.2, 1, 1])
+with c1:
+    search = st.text_input("Name", placeholder="Search employee name")
+with c2:
+    positions = sorted(x for x in filtered["Position"].unique() if x and str(x).lower() != "nan") if "Position" in filtered.columns else []
+    position = st.selectbox("Position", ["All Positions"] + positions)
+with c3:
+    types = sorted(x for x in filtered["Type of Engagement"].unique() if x and str(x).lower() != "nan") if "Type of Engagement" in filtered.columns else []
+    engagement = st.selectbox("Type of Engagement", ["All Types"] + types)
+with c4:
+    evals = sorted(x for x in filtered["Evaluation"].unique() if x and str(x).lower() != "nan") if "Evaluation" in filtered.columns else []
+    evaluation = st.selectbox("Evaluation", ["All Evaluations"] + evals)
+
+if search and "Name" in filtered.columns:
+    filtered = filtered[filtered["Name"].str.contains(search, case=False, na=False)]
+if position != "All Positions" and "Position" in filtered.columns:
+    filtered = filtered[filtered["Position"] == position]
+if engagement != "All Types" and "Type of Engagement" in filtered.columns:
+    filtered = filtered[filtered["Type of Engagement"] == engagement]
+if evaluation != "All Evaluations" and "Evaluation" in filtered.columns:
+    filtered = filtered[filtered["Evaluation"] == evaluation]
+
+r1, r2 = st.columns([4, 1.25])
+with r1:
+    st.markdown(f'<div class="section-title" style="margin-top:8px">{len(filtered):,} Staff Found</div>', unsafe_allow_html=True)
+with r2:
+    if not filtered.empty:
+        pdf = make_pdf(filtered, project, status, position, engagement, evaluation, search)
+        st.download_button("Download Filtered PDF", pdf, "OCP_Filtered_Staff_List.pdf",
+                           "application/pdf", use_container_width=True)
+
+display_df = filtered[["Name", "Position", "Type of Engagement", "Evaluation", "Status"]].copy()
+
+# Clean display values.
+for col in ["Type of Engagement", "Evaluation", "Status"]:
+    if col in display_df.columns:
+        display_df[col] = display_df[col].fillna("").astype(str).str.strip()
+        display_df.loc[display_df[col].isin(["nan", "None"]), col] = ""
+
+# Put the most informative records first.
+display_df["_has_evaluation"] = display_df["Evaluation"].ne("").astype(int) if "Evaluation" in display_df.columns else 0
+display_df["_has_status"] = display_df["Status"].ne("").astype(int) if "Status" in display_df.columns else 0
+display_df["_has_engagement"] = display_df["Type of Engagement"].ne("").astype(int) if "Type of Engagement" in display_df.columns else 0
+display_df["_information_score"] = (
+    display_df["_has_evaluation"] +
+    display_df["_has_status"] +
+    display_df["_has_engagement"]
+)
+
+sort_cols = ["_information_score", "_has_evaluation", "_has_status"]
+sort_orders = [False, False, False]
+
+if "Evaluation" in display_df.columns:
+    sort_cols.append("Evaluation")
+    sort_orders.append(False)
+if "Status" in display_df.columns:
+    sort_cols.append("Status")
+    sort_orders.append(False)
+if "Name" in display_df.columns:
+    sort_cols.append("Name")
+    sort_orders.append(True)
+
+display_df = display_df.sort_values(
+    by=sort_cols,
+    ascending=sort_orders,
+    kind="stable",
+)
+
+display_df = display_df.drop(
+    columns=["_has_evaluation", "_has_status", "_has_engagement", "_information_score"]
+)
+
+# Only after sorting, show a dash for genuinely missing values.
+for col in ["Type of Engagement", "Evaluation", "Status"]:
+    if col in display_df.columns:
+        display_df.loc[display_df[col].eq(""), col] = "—"
+
+st.dataframe(
+    display_df,
+    use_container_width=True,
+    hide_index=True,
+    height=500,
+    column_config={
+        "Name": st.column_config.TextColumn("Name", width="medium"),
+        "Position": st.column_config.TextColumn("Position", width="large"),
+        "Type of Engagement": st.column_config.TextColumn("Type of Engagement", width="medium"),
+        "Evaluation": st.column_config.TextColumn("Evaluation", width="medium"),
+        "Status": st.column_config.TextColumn("Status", width="medium"),
+    },
+)
