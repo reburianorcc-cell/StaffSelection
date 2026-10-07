@@ -1,0 +1,13 @@
+Incremental upload behavior
+===========================
+- Existing Supabase rows are NOT deleted.
+- Duplicate identity key: Name + Position + Project (case-insensitive, trimmed).
+- Only records whose key does not already exist in staff_records are inserted.
+- Duplicate rows inside the uploaded workbook are skipped.
+- XLS, XLSX and CSV uploads are supported.
+- The source file is still saved in the ocp-staff-files Storage bucket as upload history.
+
+Example:
+Database has 556 records. New file has those 556 plus 44 new records.
+Result: 44 inserted, 556 skipped, database total becomes 600.
+Uploading the same 600-row file again inserts 0 new records.

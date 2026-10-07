@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import base64
 import time
 from pathlib import Path
 import tomllib
@@ -18,6 +19,16 @@ def get_supabase_client() -> Client:
         raise ValueError("Supabase URL or Key is missing from configuration/secrets.")
     return create_client(url, key)
 st.set_page_config(page_title="Oriental Consultants Philippines Inc.", page_icon="OCP", layout="wide")
+
+def _logo_data_uri():
+    logo_path = Path(__file__).resolve().parent / "oc_philippines_logo.png"
+    try:
+        encoded = base64.b64encode(logo_path.read_bytes()).decode("ascii")
+        return f"data:image/png;base64,{encoded}"
+    except Exception:
+        return ""
+
+LOGO_URI = _logo_data_uri()
 
 USERNAME = "admin"
 PASSWORD = "ocg123"
@@ -493,20 +504,28 @@ def find_header(raw):
 
 
 def load_upload(uploaded):
-    """Read an uploaded CSV or all worksheets in an uploaded Excel workbook."""
+    """Read CSV, XLSX, or legacy XLS files, including all Excel worksheets."""
     suffix = Path(uploaded.name).suffix.lower()
 
     if suffix == ".csv":
         uploaded.seek(0)
-        df = pd.read_csv(uploaded)
+        try:
+            df = pd.read_csv(uploaded)
+        except UnicodeDecodeError:
+            uploaded.seek(0)
+            df = pd.read_csv(uploaded, encoding="latin-1")
         df = enrich_staff_fields(normalize_columns(df))
         if "Project" not in df.columns:
             df["Project"] = Path(uploaded.name).stem
         return df
 
+    if suffix not in {".xlsx", ".xls"}:
+        raise ValueError("Unsupported file format. Please upload .xlsx, .xls, or .csv.")
+
     frames = []
     uploaded.seek(0)
-    xls = pd.ExcelFile(uploaded)
+    engine = "xlrd" if suffix == ".xls" else "openpyxl"
+    xls = pd.ExcelFile(uploaded, engine=engine)
 
     for sheet in xls.sheet_names:
         try:
@@ -636,49 +655,126 @@ def fetch_staff_from_supabase():
         return empty
 
 
+def _dedupe_key(name, position, project):
+    """Build a case-insensitive key used to identify the same staff/project record."""
+    def norm(value):
+        if value is None or pd.isna(value):
+            return ""
+        return " ".join(str(value).strip().lower().split())
+    return (norm(name), norm(position), norm(project))
+
+
 def upload_staff_to_supabase(uploaded, parsed_df):
-    """Store the original file in Supabase Storage and its rows in PostgreSQL."""
+    """Upload the source file and insert only staff records not already in Supabase.
+
+    A record is considered already present when Name + Position + Project match
+    case-insensitively. Duplicate rows inside the newly uploaded workbook are also skipped.
+    Existing database rows are never deleted by this upload routine.
+    """
     client = get_supabase_client()
     if client is None:
-        raise RuntimeError("Supabase is not configured. Check .streamlit/secrets.toml and make sure it contains your Supabase URL and Key.")
+        raise RuntimeError(
+            "Supabase is not configured. Check .streamlit/secrets.toml and make sure "
+            "it contains your Supabase URL and Key."
+        )
 
+    filename = Path(uploaded.name).name
     file_bytes = uploaded.getvalue()
-    filename = uploaded.name
-    safe_name = Path(filename).name.replace(" ", "_")
+    safe_name = filename.replace(" ", "_")
     timestamp = pd.Timestamp.utcnow().strftime("%Y%m%d_%H%M%S")
     storage_path = f"staff/{timestamp}_{safe_name}"
 
-    content_type = "text/csv" if filename.lower().endswith(".csv") else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".csv":
+        content_type = "text/csv"
+    elif suffix == ".xls":
+        content_type = "application/vnd.ms-excel"
+    else:
+        content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    # Keep the uploaded source file in Storage as an upload/version history.
     client.storage.from_("ocp-staff-files").upload(
         storage_path,
         file_bytes,
         {"content-type": content_type, "upsert": "false"}
     )
 
-    records = parsed_df[["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"]].copy()
-    records = records.fillna("").astype(str)
-    records["source_file"] = filename
-    records["source_path"] = storage_path
-    records["uploaded_at"] = pd.Timestamp.utcnow().isoformat()
+    # Read every existing staff key from Supabase. Pagination is important because
+    # Supabase/PostgREST commonly returns at most 1,000 rows per request.
+    existing_keys = set()
+    start = 0
+    page_size = 1000
+    while True:
+        result = (
+            client.table("staff_records")
+            .select("name,position,project")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        batch = result.data or []
+        for row in batch:
+            existing_keys.add(_dedupe_key(
+                row.get("name", ""),
+                row.get("position", ""),
+                row.get("project", "")
+            ))
+        if len(batch) < page_size:
+            break
+        start += page_size
 
-    # Replace records previously uploaded from the same source filename.
-    client.table("staff_records").delete().eq("source_file", filename).execute()
+    source = parsed_df[[
+        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"
+    ]].copy()
+    source = source.fillna("").astype(str)
 
-    payload = records.rename(columns={
-        "Name": "name",
-        "Position": "position",
-        "Type of Engagement": "type_of_engagement",
-        "Evaluation": "evaluation",
-        "Status": "status",
-        "Project": "project",
-    }).to_dict(orient="records")
+    new_records = []
+    seen_in_upload = set()
+    skipped_existing = 0
+    skipped_upload_duplicates = 0
+    uploaded_at = pd.Timestamp.utcnow().isoformat()
 
+    for _, row in source.iterrows():
+        key = _dedupe_key(row["Name"], row["Position"], row["Project"])
+
+        # Ignore rows without a usable employee name.
+        if not key[0]:
+            continue
+
+        # Do not reinsert a staff/project combination already stored in Supabase.
+        if key in existing_keys:
+            skipped_existing += 1
+            continue
+
+        # Also protect against duplicate rows inside the same workbook.
+        if key in seen_in_upload:
+            skipped_upload_duplicates += 1
+            continue
+
+        seen_in_upload.add(key)
+        new_records.append({
+            "name": str(row["Name"]).strip(),
+            "position": str(row["Position"]).strip(),
+            "type_of_engagement": str(row["Type of Engagement"]).strip(),
+            "evaluation": str(row["Evaluation"]).strip(),
+            "status": str(row["Status"]).strip(),
+            "project": str(row["Project"]).strip(),
+            "source_file": filename,
+            "source_path": storage_path,
+            "uploaded_at": uploaded_at,
+        })
+
+    # Insert only genuinely new records, in safe batches.
     batch_size = 500
-    for i in range(0, len(payload), batch_size):
-        client.table("staff_records").insert(payload[i:i + batch_size]).execute()
+    for i in range(0, len(new_records), batch_size):
+        client.table("staff_records").insert(new_records[i:i + batch_size]).execute()
 
-    return storage_path, len(payload)
-
+    return {
+        "storage_path": storage_path,
+        "uploaded_rows": len(source),
+        "added": len(new_records),
+        "skipped_existing": skipped_existing,
+        "skipped_upload_duplicates": skipped_upload_duplicates,
+    }
 
 def make_pdf(df, project, status, position, engagement, evaluation, search):
     buffer = io.BytesIO()
@@ -719,9 +815,9 @@ def make_pdf(df, project, status, position, engagement, evaluation, search):
 # Login loading transition shown as a floating modal over the login page
 if st.session_state.login_loading and not st.session_state.logged_in:
     # Keep the login page visually present behind the modal.
-    st.markdown("""
+    st.markdown(f"""
     <div class="login-wrap">
-      <div class="login-logo">OCP</div>
+      <img src="{LOGO_URI}" alt="OC Philippines" style="width:110px;height:110px;object-fit:contain;margin-bottom:8px;" />
       <div class="login-title">Oriental Consultants Philippines Inc.</div>
       <div class="login-sub">Employee Database Monitoring</div>
     </div>
@@ -731,10 +827,10 @@ if st.session_state.login_loading and not st.session_state.logged_in:
         st.text_input("Password", value="••••••••", disabled=True)
         st.form_submit_button("Log In", use_container_width=True, disabled=True)
 
-    st.markdown("""
+    st.markdown(f"""
     <div class="login-modal-backdrop"></div>
     <div class="login-modal-card">
-        <div class="login-modal-mark">OCP</div>
+        <img src="{LOGO_URI}" alt="OC Philippines" style="width:74px;height:74px;object-fit:contain;margin:0 auto 8px;display:block;" />
         <div class="login-modal-spinner"></div>
         <div class="login-modal-title">Signing you in...</div>
         <div class="login-modal-text">Preparing your Personnel Selection Portal</div>
@@ -748,9 +844,9 @@ if st.session_state.login_loading and not st.session_state.logged_in:
 
 # Login
 if not st.session_state.logged_in:
-    st.markdown("""
+    st.markdown(f"""
     <div class="login-wrap">
-      <div class="login-logo">OCP</div>
+      <img src="{LOGO_URI}" alt="OC Philippines" style="width:110px;height:110px;object-fit:contain;margin-bottom:8px;" />
       <div class="login-title">Oriental Consultants Philippines Inc.</div>
       <div class="login-sub">Employee Database Monitoring</div>
     </div>
@@ -777,10 +873,12 @@ active_df = fetch_staff_from_supabase()
 
 
 # Classic OCP header layout
-st.markdown("""
+st.markdown(f"""
 <div class="classic-ocp-header">
     <div class="classic-ocp-brand">
-        <div class="classic-ocp-logo">OCP</div>
+        <div class="classic-ocp-logo" style="background:transparent;padding:0;display:flex;align-items:center;justify-content:center;">
+            <img src="{LOGO_URI}" alt="OC Philippines" style="width:68px;height:68px;object-fit:contain;" />
+        </div>
         <div>
             <div class="classic-ocp-title">Oriental Consultants Philippines Inc.</div>
             <div class="classic-ocp-subtitle">Employee Database Monitoring</div>
@@ -795,11 +893,11 @@ _admin_space, _admin_col = st.columns([5, 1])
 with _admin_col:
     with st.popover("Admin  ▾", use_container_width=True):
         st.markdown("**Staff Database**")
-        st.caption("Upload an Excel or CSV file to Supabase. The dashboard reads the saved records from Supabase.")
+        st.caption("Upload an Excel or CSV file to Supabase. Existing staff are skipped and only new records are added.")
 
         uploaded = st.file_uploader(
             "Upload Staff Database",
-            type=["xlsx", "csv"],
+            type=["xlsx", "xls", "csv"],
             key="staff_database_upload",
             help="The original file is stored in Supabase Storage and its records are saved in the Supabase database."
         )
@@ -819,10 +917,24 @@ with _admin_col:
                     if st.button("Upload File to Supabase", type="primary", use_container_width=True):
                         with st.spinner("Uploading file and saving records to Supabase..."):
                             try:
-                                storage_path, count = upload_staff_to_supabase(uploaded, preview)
+                                result = upload_staff_to_supabase(uploaded, preview)
                                 st.session_state.uploaded_name = uploaded.name
                                 st.session_state.uploaded_df = None
-                                st.success(f"Uploaded to Supabase successfully: {count:,} staff records saved.")
+                                if result["added"] > 0:
+                                    st.success(
+                                        f"Upload complete: {result['added']:,} new staff record(s) added. "
+                                        f"{result['skipped_existing']:,} existing record(s) skipped."
+                                    )
+                                else:
+                                    st.info(
+                                        f"Upload complete: no new staff records were found. "
+                                        f"{result['skipped_existing']:,} existing record(s) were skipped."
+                                    )
+                                if result["skipped_upload_duplicates"]:
+                                    st.caption(
+                                        f"{result['skipped_upload_duplicates']:,} duplicate row(s) inside the uploaded file were also skipped."
+                                    )
+                                time.sleep(1.2)
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Supabase upload failed: {e}")
