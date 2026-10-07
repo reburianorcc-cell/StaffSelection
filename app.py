@@ -81,7 +81,57 @@ div[data-testid="stTextInput"] [data-baseweb="input"] {
 .stButton > button, .stDownloadButton > button {
     min-height:48px;border-radius:10px;font-weight:700;
 }
-div[data-testid="stDataFrame"] {border-radius:12px;overflow:hidden;}
+div[data-testid="stDataFrame"] {border-radius:14px;overflow:hidden;border:1px solid #e3e9f0;background:#fff;}
+
+/* Modern responsive evaluation guide */
+.eval-guide {
+    background:#ffffff;
+    border:1px solid #dfe6ee;
+    border-radius:14px;
+    padding:14px 16px;
+    margin:8px 0 14px 0;
+    box-shadow:0 4px 14px rgba(20,45,75,.035);
+}
+.eval-guide-head {
+    display:flex;align-items:center;justify-content:space-between;gap:12px;
+    margin-bottom:10px;
+}
+.eval-guide-title {font-size:14px;font-weight:800;color:#092e50;}
+.eval-guide-note {font-size:12px;color:#7b8794;}
+.eval-guide-grid {
+    display:grid;
+    grid-template-columns:repeat(5,minmax(120px,1fr));
+    gap:8px;
+}
+.eval-chip {
+    background:#f7f9fc;
+    border:1px solid #e6ebf1;
+    border-radius:10px;
+    padding:9px 11px;
+    min-width:0;
+}
+.eval-chip-label {font-size:12px;font-weight:700;color:#24384b;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.eval-chip-score {font-size:13px;font-weight:800;color:#0c4a78;margin-top:3px;}
+
+/* Responsive dashboard */
+@media (max-width: 900px) {
+    .block-container {padding-left:1rem !important;padding-right:1rem !important;padding-top:1rem !important;}
+    .ocp-portal-header {padding:18px;gap:14px;align-items:flex-start;}
+    .ocp-header-title {font-size:19px;}
+    .ocp-header-subtitle {font-size:13px;margin-top:5px;}
+    .ocp-portal-pill {font-size:12px;padding:9px 12px;}
+    .eval-guide-grid {grid-template-columns:repeat(2,minmax(0,1fr));}
+}
+@media (max-width: 600px) {
+    .ocp-portal-header {flex-direction:column;}
+    .ocp-portal-pill {width:100%;text-align:center;box-sizing:border-box;}
+    .section-title {font-size:17px;}
+    .section-sub {font-size:13px;}
+    .eval-guide-head {align-items:flex-start;flex-direction:column;gap:3px;}
+    .eval-guide-grid {grid-template-columns:1fr;}
+    .eval-chip {padding:8px 10px;}
+    div[data-testid="stDataFrame"] {overflow-x:auto;}
+}
 
 /* Login */
 .login-wrap {max-width:500px;margin:5vh auto 18px;text-align:center;}
@@ -1361,6 +1411,26 @@ with r2:
         pdf = make_pdf(filtered, project, status, position, engagement, evaluation, search)
         st.download_button("Download Filtered PDF", pdf, "OCP_Filtered_Staff_List.pdf",
                            "application/pdf", use_container_width=True)
+
+# Evaluation legend / scoring guide
+st.markdown(
+    """
+    <div class="eval-guide">
+        <div class="eval-guide-head">
+            <div class="eval-guide-title">Evaluation Guide</div>
+            <div class="eval-guide-note">Reference score range</div>
+        </div>
+        <div class="eval-guide-grid">
+            <div class="eval-chip"><div class="eval-chip-label">Excellent</div><div class="eval-chip-score">45–50</div></div>
+            <div class="eval-chip"><div class="eval-chip-label">Exceed Requirements</div><div class="eval-chip-score">40–44</div></div>
+            <div class="eval-chip"><div class="eval-chip-label">Meet Requirements</div><div class="eval-chip-score">31–39</div></div>
+            <div class="eval-chip"><div class="eval-chip-label">Need Improvement</div><div class="eval-chip-score">21–30</div></div>
+            <div class="eval-chip"><div class="eval-chip-label">Unsatisfactory</div><div class="eval-chip-score">10–20</div></div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 display_df = filtered[["Name", "Position", "Type of Engagement", "Evaluation", "Status"]].copy()
 
