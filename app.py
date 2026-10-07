@@ -665,11 +665,16 @@ def _dedupe_key(name, position, project):
 
 
 def upload_staff_to_supabase(uploaded, parsed_df):
-    """Upload the source file and insert only staff records not already in Supabase.
+    """Synchronize an uploaded staff file with Supabase.
 
-    A record is considered already present when Name + Position + Project match
-    case-insensitively. Duplicate rows inside the newly uploaded workbook are also skipped.
-    Existing database rows are never deleted by this upload routine.
+    Matching key: Name + Position + Project (case-insensitive, whitespace-normalized).
+
+    - New key -> INSERT
+    - Existing key with changed engagement/evaluation/status -> UPDATE
+    - Existing key with no changes -> SKIP
+    - Duplicate key inside the same upload -> SKIP
+
+    The uploaded source file is also stored in Supabase Storage as version history.
     """
     client = get_supabase_client()
     if client is None:
@@ -692,32 +697,33 @@ def upload_staff_to_supabase(uploaded, parsed_df):
     else:
         content_type = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-    # Keep the uploaded source file in Storage as an upload/version history.
+    # Keep the source file as upload/version history.
     client.storage.from_("ocp-staff-files").upload(
         storage_path,
         file_bytes,
         {"content-type": content_type, "upsert": "false"}
     )
 
-    # Read every existing staff key from Supabase. Pagination is important because
-    # Supabase/PostgREST commonly returns at most 1,000 rows per request.
-    existing_keys = set()
+    # Load all current records. Pagination avoids the common 1,000-row API limit.
+    existing_lookup = {}
     start = 0
     page_size = 1000
     while True:
         result = (
             client.table("staff_records")
-            .select("name,position,project")
+            .select("id,name,position,type_of_engagement,evaluation,status,project,source_file,source_path")
             .range(start, start + page_size - 1)
             .execute()
         )
         batch = result.data or []
-        for row in batch:
-            existing_keys.add(_dedupe_key(
-                row.get("name", ""),
-                row.get("position", ""),
-                row.get("project", "")
-            ))
+        for record in batch:
+            key = _dedupe_key(
+                record.get("name", ""),
+                record.get("position", ""),
+                record.get("project", "")
+            )
+            if key[0]:
+                existing_lookup[key] = record
         if len(batch) < page_size:
             break
         start += page_size
@@ -727,55 +733,105 @@ def upload_staff_to_supabase(uploaded, parsed_df):
     ]].copy()
     source = source.fillna("").astype(str)
 
-    new_records = []
-    seen_in_upload = set()
-    skipped_existing = 0
+    def norm(value):
+        if value is None or pd.isna(value):
+            return ""
+        return " ".join(str(value).strip().lower().split())
+
+    inserted = 0
+    updated = 0
+    unchanged = 0
     skipped_upload_duplicates = 0
+    seen_in_upload = set()
     uploaded_at = pd.Timestamp.utcnow().isoformat()
+    new_records = []
 
     for _, row in source.iterrows():
-        key = _dedupe_key(row["Name"], row["Position"], row["Project"])
+        name = str(row["Name"]).strip()
+        position = str(row["Position"]).strip()
+        engagement = str(row["Type of Engagement"]).strip()
+        evaluation = str(row["Evaluation"]).strip()
+        status = str(row["Status"]).strip()
+        project = str(row["Project"]).strip()
 
-        # Ignore rows without a usable employee name.
+        key = _dedupe_key(name, position, project)
         if not key[0]:
             continue
 
-        # Do not reinsert a staff/project combination already stored in Supabase.
-        if key in existing_keys:
-            skipped_existing += 1
-            continue
-
-        # Also protect against duplicate rows inside the same workbook.
+        # Prevent duplicate rows inside the same workbook/upload.
         if key in seen_in_upload:
             skipped_upload_duplicates += 1
             continue
-
         seen_in_upload.add(key)
-        new_records.append({
-            "name": str(row["Name"]).strip(),
-            "position": str(row["Position"]).strip(),
-            "type_of_engagement": str(row["Type of Engagement"]).strip(),
-            "evaluation": str(row["Evaluation"]).strip(),
-            "status": str(row["Status"]).strip(),
-            "project": str(row["Project"]).strip(),
-            "source_file": filename,
-            "source_path": storage_path,
-            "uploaded_at": uploaded_at,
-        })
 
-    # Insert only genuinely new records, in safe batches.
+        existing = existing_lookup.get(key)
+
+        if existing is None:
+            new_records.append({
+                "name": name,
+                "position": position,
+                "type_of_engagement": engagement,
+                "evaluation": evaluation,
+                "status": status,
+                "project": project,
+                "source_file": filename,
+                "source_path": storage_path,
+                "uploaded_at": uploaded_at,
+            })
+            continue
+
+        # Existing employee/project: compare fields that are allowed to change.
+        changes = {}
+        if norm(existing.get("type_of_engagement")) != norm(engagement):
+            changes["type_of_engagement"] = engagement
+        if norm(existing.get("evaluation")) != norm(evaluation):
+            changes["evaluation"] = evaluation
+        if norm(existing.get("status")) != norm(status):
+            changes["status"] = status
+
+        if changes:
+            # Record where the latest values came from.
+            changes["source_file"] = filename
+            changes["source_path"] = storage_path
+            changes["uploaded_at"] = uploaded_at
+
+            (
+                client.table("staff_records")
+                .update(changes)
+                .eq("id", existing["id"])
+                .execute()
+            )
+            existing.update(changes)
+            updated += 1
+        else:
+            unchanged += 1
+
+    # Insert genuinely new records in batches.
     batch_size = 500
     for i in range(0, len(new_records), batch_size):
-        client.table("staff_records").insert(new_records[i:i + batch_size]).execute()
+        batch = new_records[i:i + batch_size]
+        result = client.table("staff_records").insert(batch).execute()
+        inserted += len(batch)
+
+        # Keep the in-memory lookup current during this upload.
+        for record in (result.data or []):
+            key = _dedupe_key(
+                record.get("name", ""),
+                record.get("position", ""),
+                record.get("project", "")
+            )
+            if key[0]:
+                existing_lookup[key] = record
 
     return {
         "storage_path": storage_path,
         "uploaded_rows": len(source),
-        "added": len(new_records),
-        "skipped_existing": skipped_existing,
+        "added": inserted,
+        "updated": updated,
+        "unchanged": unchanged,
+        "skipped_existing": unchanged,  # backward-compatible key
         "skipped_upload_duplicates": skipped_upload_duplicates,
     }
-
 
 def fetch_staff_for_editor():
     """Load editable staff rows including the database ID."""
@@ -1190,16 +1246,12 @@ with _admin_col:
                                 result = upload_staff_to_supabase(uploaded, preview)
                                 st.session_state.uploaded_name = uploaded.name
                                 st.session_state.uploaded_df = None
-                                if result["added"] > 0:
-                                    st.success(
-                                        f"Upload complete: {result['added']:,} new staff record(s) added. "
-                                        f"{result['skipped_existing']:,} existing record(s) skipped."
-                                    )
-                                else:
-                                    st.info(
-                                        f"Upload complete: no new staff records were found. "
-                                        f"{result['skipped_existing']:,} existing record(s) were skipped."
-                                    )
+                                st.success(
+                                    f"Database synchronized successfully — "
+                                    f"{result['added']:,} new record(s) added, "
+                                    f"{result['updated']:,} existing record(s) updated, and "
+                                    f"{result['unchanged']:,} unchanged record(s) skipped."
+                                )
                                 if result["skipped_upload_duplicates"]:
                                     st.caption(
                                         f"{result['skipped_upload_duplicates']:,} duplicate row(s) inside the uploaded file were also skipped."
