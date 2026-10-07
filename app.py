@@ -776,6 +776,260 @@ def upload_staff_to_supabase(uploaded, parsed_df):
         "skipped_upload_duplicates": skipped_upload_duplicates,
     }
 
+
+def fetch_staff_for_editor():
+    """Load editable staff rows including the database ID."""
+    client = get_supabase_client()
+    if client is None:
+        return pd.DataFrame(columns=["id", "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"])
+
+    rows = []
+    start = 0
+    page_size = 1000
+    while True:
+        result = (
+            client.table("staff_records")
+            .select("id,name,position,type_of_engagement,evaluation,status,project")
+            .order("id")
+            .range(start, start + page_size - 1)
+            .execute()
+        )
+        batch = result.data or []
+        rows.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+
+    if not rows:
+        return pd.DataFrame(columns=["id", "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"])
+
+    return pd.DataFrame(rows).rename(columns={
+        "name": "Name",
+        "position": "Position",
+        "type_of_engagement": "Type of Engagement",
+        "evaluation": "Evaluation",
+        "status": "Status",
+        "project": "Project",
+    })
+
+
+def save_staff_editor_changes(original_df, edited_df):
+    """Update changed rows and insert rows added in the Admin editor."""
+    client = get_supabase_client()
+    if client is None:
+        raise RuntimeError("Supabase is not configured.")
+
+    fields = ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"]
+    db_fields = {
+        "Name": "name",
+        "Position": "position",
+        "Type of Engagement": "type_of_engagement",
+        "Evaluation": "evaluation",
+        "Status": "status",
+        "Project": "project",
+    }
+
+    def clean(v):
+        if v is None or pd.isna(v):
+            return ""
+        return str(v).strip()
+
+    original_by_id = {}
+    if original_df is not None and not original_df.empty:
+        for _, row in original_df.iterrows():
+            if pd.notna(row.get("id")):
+                original_by_id[int(row["id"])] = {f: clean(row.get(f, "")) for f in fields}
+
+    updated = 0
+    added = 0
+    seen_new = set()
+
+    for _, row in edited_df.iterrows():
+        values = {f: clean(row.get(f, "")) for f in fields}
+        if not values["Name"] and not values["Position"]:
+            continue
+
+        row_id = row.get("id")
+        payload = {db_fields[f]: values[f] for f in fields}
+
+        if pd.notna(row_id) and str(row_id).strip() not in ("", "nan", "None"):
+            rid = int(float(row_id))
+            if original_by_id.get(rid) != values:
+                client.table("staff_records").update(payload).eq("id", rid).execute()
+                updated += 1
+        else:
+            key = _dedupe_key(values["Name"], values["Position"], values["Project"])
+            if key in seen_new:
+                continue
+            seen_new.add(key)
+
+            exists = (
+                client.table("staff_records")
+                .select("id")
+                .ilike("name", values["Name"])
+                .ilike("position", values["Position"])
+                .ilike("project", values["Project"])
+                .limit(1)
+                .execute()
+            )
+            if exists.data:
+                continue
+
+            payload.update({
+                "source_file": "Admin manual entry",
+                "source_path": "",
+                "uploaded_at": pd.Timestamp.utcnow().isoformat(),
+            })
+            client.table("staff_records").insert(payload).execute()
+            added += 1
+
+    return {"updated": updated, "added": added}
+
+
+@st.dialog("Add & Edit Staff Data", width="large")
+def staff_editor_dialog():
+    st.caption("Search or filter staff first, then edit the exact record you need. Changes are saved directly to Supabase.")
+    try:
+        original = fetch_staff_for_editor()
+    except Exception as exc:
+        st.error(f"Unable to load staff records: {exc}")
+        return
+
+    if original.empty:
+        st.info("No staff records are available to edit.")
+        return
+
+    # ---------------------------------------------------------
+    # SEARCH & FILTERS
+    # ---------------------------------------------------------
+    st.markdown("#### Search & Filter")
+
+    f1, f2, f3, f4 = st.columns([2.0, 1.35, 1.25, 1.7])
+
+    with f1:
+        search_name = st.text_input(
+            "Search Name",
+            placeholder="Search employee name...",
+            key="edit_search_name",
+        )
+
+    project_values = sorted(
+        x for x in original["Project"].fillna("").astype(str).str.strip().unique().tolist()
+        if x
+    )
+    status_values = sorted(
+        x for x in original["Status"].fillna("").astype(str).str.strip().unique().tolist()
+        if x
+    )
+    position_values = sorted(
+        x for x in original["Position"].fillna("").astype(str).str.strip().unique().tolist()
+        if x
+    )
+
+    with f2:
+        selected_project = st.selectbox(
+            "Project",
+            ["All Projects"] + project_values,
+            key="edit_filter_project",
+        )
+
+    with f3:
+        selected_status = st.selectbox(
+            "Status",
+            ["All Status"] + status_values,
+            key="edit_filter_status",
+        )
+
+    with f4:
+        selected_position = st.selectbox(
+            "Position",
+            ["All Positions"] + position_values,
+            key="edit_filter_position",
+        )
+
+    filtered = original.copy()
+
+    if search_name.strip():
+        filtered = filtered[
+            filtered["Name"].fillna("").astype(str).str.contains(
+                search_name.strip(), case=False, na=False, regex=False
+            )
+        ]
+
+    if selected_project != "All Projects":
+        filtered = filtered[
+            filtered["Project"].fillna("").astype(str).str.strip() == selected_project
+        ]
+
+    if selected_status != "All Status":
+        filtered = filtered[
+            filtered["Status"].fillna("").astype(str).str.strip() == selected_status
+        ]
+
+    if selected_position != "All Positions":
+        filtered = filtered[
+            filtered["Position"].fillna("").astype(str).str.strip() == selected_position
+        ]
+
+    st.caption(f"Showing {len(filtered):,} of {len(original):,} staff records")
+
+    if filtered.empty:
+        st.warning("No staff records match the current search and filters.")
+        return
+
+    editor_source = filtered.copy()
+    if "id" not in editor_source.columns:
+        editor_source.insert(0, "id", pd.NA)
+
+    # The editor key changes with the active filters so Streamlit always shows
+    # the correct filtered rows instead of retaining rows from a previous filter.
+    editor_key = (
+        f"admin_staff_editor::{search_name.strip().lower()}::"
+        f"{selected_project}::{selected_status}::{selected_position}"
+    )
+
+    edited = st.data_editor(
+        editor_source,
+        key=editor_key,
+        hide_index=True,
+        use_container_width=True,
+        num_rows="dynamic",
+        disabled=["id"],
+        column_config={
+            "id": st.column_config.NumberColumn("ID", help="Supabase record ID", width="small"),
+            "Name": st.column_config.TextColumn("Name", required=True),
+            "Position": st.column_config.TextColumn("Position"),
+            "Type of Engagement": st.column_config.TextColumn("Type of Engagement"),
+            "Evaluation": st.column_config.TextColumn("Evaluation"),
+            "Status": st.column_config.TextColumn("Status"),
+            "Project": st.column_config.TextColumn("Project"),
+        },
+        height=520,
+    )
+
+    st.caption(
+        "Edit the filtered records above, or use the blank row at the bottom to add a candidate. "
+        "Only the records currently shown are evaluated when you save."
+    )
+
+    if st.button("Save Staff Changes", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Saving changes to Supabase..."):
+                # Pass only the filtered originals. Hidden records are never overwritten.
+                result = save_staff_editor_changes(filtered, edited)
+            if result["added"] == 0 and result["updated"] == 0:
+                st.info("No changes were detected.")
+            else:
+                st.success(
+                    f"Saved successfully: {result['added']:,} new record(s) added and "
+                    f"{result['updated']:,} record(s) updated."
+                )
+                time.sleep(1.0)
+                st.rerun()
+        except Exception as exc:
+            st.error(f"Unable to save changes: {exc}")
+
+
 def make_pdf(df, project, status, position, engagement, evaluation, search):
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
@@ -893,9 +1147,25 @@ _admin_space, _admin_col = st.columns([5, 1])
 with _admin_col:
     with st.popover("Admin  ▾", use_container_width=True):
         st.markdown("**Staff Database**")
-        st.caption("Upload an Excel or CSV file to Supabase. Existing staff are skipped and only new records are added.")
+        admin_category = st.radio(
+            "Admin Category",
+            ["Upload Staff Database", "Add & Edit Staff Data"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="admin_category"
+        )
 
-        uploaded = st.file_uploader(
+        if admin_category == "Add & Edit Staff Data":
+            st.caption("Add new staff or edit existing staff information directly in Supabase for evaluation.")
+            if st.button("Open Add & Edit Staff Data", type="primary", use_container_width=True):
+                staff_editor_dialog()
+            st.divider()
+        else:
+            st.caption("Upload an Excel or CSV file to Supabase. Existing staff are skipped and only new records are added.")
+
+        uploaded = None
+        if admin_category == "Upload Staff Database":
+            uploaded = st.file_uploader(
             "Upload Staff Database",
             type=["xlsx", "xls", "csv"],
             key="staff_database_upload",
