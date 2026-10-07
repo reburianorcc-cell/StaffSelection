@@ -960,7 +960,7 @@ def staff_editor_dialog():
     # ---------------------------------------------------------
     st.markdown("#### Search & Filter")
 
-    f1, f2, f3, f4 = st.columns([2.0, 1.35, 1.25, 1.7])
+    f1, f2, f3, f4, f5 = st.columns([2.0, 1.25, 1.15, 1.5, 1.35])
 
     with f1:
         search_name = st.text_input(
@@ -979,6 +979,10 @@ def staff_editor_dialog():
     )
     position_values = sorted(
         x for x in original["Position"].fillna("").astype(str).str.strip().unique().tolist()
+        if x
+    )
+    evaluation_values = sorted(
+        x for x in original["Evaluation"].fillna("").astype(str).str.strip().unique().tolist()
         if x
     )
 
@@ -1001,6 +1005,13 @@ def staff_editor_dialog():
             "Position",
             ["All Positions"] + position_values,
             key="edit_filter_position",
+        )
+
+    with f5:
+        selected_evaluation = st.selectbox(
+            "Evaluation",
+            ["All Evaluations"] + evaluation_values,
+            key="edit_filter_evaluation",
         )
 
     filtered = original.copy()
@@ -1027,6 +1038,11 @@ def staff_editor_dialog():
             filtered["Position"].fillna("").astype(str).str.strip() == selected_position
         ]
 
+    if selected_evaluation != "All Evaluations":
+        filtered = filtered[
+            filtered["Evaluation"].fillna("").astype(str).str.strip() == selected_evaluation
+        ]
+
     st.caption(f"Showing {len(filtered):,} of {len(original):,} staff records")
 
     if filtered.empty:
@@ -1041,7 +1057,7 @@ def staff_editor_dialog():
     # the correct filtered rows instead of retaining rows from a previous filter.
     editor_key = (
         f"admin_staff_editor::{search_name.strip().lower()}::"
-        f"{selected_project}::{selected_status}::{selected_position}"
+        f"{selected_project}::{selected_status}::{selected_position}::{selected_evaluation}"
     )
 
     edited = st.data_editor(
