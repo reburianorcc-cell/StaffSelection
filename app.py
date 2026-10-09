@@ -1224,7 +1224,7 @@ if not st.session_state.logged_in:
     <div class="login-wrap">
       <img src="{LOGO_URI}" alt="OC Philippines" style="width:110px;height:110px;object-fit:contain;margin-bottom:8px;" />
       <div class="login-title">Oriental Consultants Philippines Inc.</div>
-      <div class="login-sub">Employee Database Monitoring</div>
+      <div class="login-sub">Employee Evaluation Database Monitoring</div>
     </div>
     """, unsafe_allow_html=True)
     with st.form("login_form"):
