@@ -1257,7 +1257,7 @@ st.markdown(f"""
         </div>
         <div>
             <div class="classic-ocp-title">Oriental Consultants Philippines Inc.</div>
-            <div class="classic-ocp-subtitle">Employee Database Monitoring</div>
+            <div class="classic-ocp-subtitle">Employee Evaluation Database Monitoring</div>
         </div>
     </div>
     <div class="classic-portal-pill">Personnel Selection Portal</div>
