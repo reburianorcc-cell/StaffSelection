@@ -31,7 +31,7 @@ def _logo_data_uri():
 LOGO_URI = _logo_data_uri()
 
 USERNAME = "admin"
-PASSWORD = "ocg123"
+PASSWORD = "ocp123"
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
