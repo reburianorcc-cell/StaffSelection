@@ -1421,7 +1421,7 @@ st.markdown(
             <div class="eval-guide-note">Reference score range</div>
         </div>
         <div class="eval-guide-grid">
-            <div class="eval-chip"><div class="eval-chip-label">Excellent</div><div class="eval-chip-score">45–50</div></div>
+            <div class="eval-chip"><div class="eval-chip-label">Exceptional</div><div class="eval-chip-score">45–50</div></div>
             <div class="eval-chip"><div class="eval-chip-label">Exceed Requirements</div><div class="eval-chip-score">40–44</div></div>
             <div class="eval-chip"><div class="eval-chip-label">Meet Requirements</div><div class="eval-chip-score">31–39</div></div>
             <div class="eval-chip"><div class="eval-chip-label">Need Improvement</div><div class="eval-chip-score">21–30</div></div>
