@@ -1,5 +1,3 @@
-HEAD
->>>>>>> 939cd2b44818b9fc8768d537634da1d4a86bb90d
 import re
 import streamlit as st
 import pandas as pd
@@ -1524,7 +1522,6 @@ with r2:
         st.download_button("Download Filtered PDF", pdf, "OCP_Filtered_Staff_List.pdf",
                            "application/pdf", use_container_width=True)
 
-<<<<<<< HEAD
 display_df = filtered[["Name", "Position", "Sector", "Experience", "Evaluation"]].copy()
 for col in display_df.columns:
     display_df[col] = display_df[col].fillna("").astype(str).str.strip()
@@ -1533,74 +1530,6 @@ rank = {"Exceptional": 0, "Exceed Requirements": 1}
 display_df["_evaluation_rank"] = display_df["Evaluation"].map(rank).fillna(2)
 display_df = display_df.sort_values(["_evaluation_rank", "Name"], ascending=[True, True], kind="stable").drop(columns="_evaluation_rank")
 display_df = display_df.replace("", "—")
-=======
-# Evaluation legend / scoring guide
-st.markdown(
-    """
-    <div class="eval-guide">
-        <div class="eval-guide-head">
-            <div class="eval-guide-title">Evaluation Guide</div>
-            <div class="eval-guide-note">Reference score range</div>
-        </div>
-        <div class="eval-guide-grid">
-            <div class="eval-chip"><div class="eval-chip-label">Exceptional</div><div class="eval-chip-score">45–50</div></div>
-            <div class="eval-chip"><div class="eval-chip-label">Exceed Requirements</div><div class="eval-chip-score">40–44</div></div>
-            <div class="eval-chip"><div class="eval-chip-label">Meet Requirements</div><div class="eval-chip-score">31–39</div></div>
-            <div class="eval-chip"><div class="eval-chip-label">Need Improvement</div><div class="eval-chip-score">21–30</div></div>
-            <div class="eval-chip"><div class="eval-chip-label">Unsatisfactory</div><div class="eval-chip-score">10–20</div></div>
-        </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-display_df = filtered[["Name", "Position", "Type of Engagement", "Evaluation", "Status"]].copy()
-
-# Clean display values.
-for col in ["Type of Engagement", "Evaluation", "Status"]:
-    if col in display_df.columns:
-        display_df[col] = display_df[col].fillna("").astype(str).str.strip()
-        display_df.loc[display_df[col].isin(["nan", "None"]), col] = ""
-
-# Put the most informative records first.
-display_df["_has_evaluation"] = display_df["Evaluation"].ne("").astype(int) if "Evaluation" in display_df.columns else 0
-display_df["_has_status"] = display_df["Status"].ne("").astype(int) if "Status" in display_df.columns else 0
-display_df["_has_engagement"] = display_df["Type of Engagement"].ne("").astype(int) if "Type of Engagement" in display_df.columns else 0
-display_df["_information_score"] = (
-    display_df["_has_evaluation"] +
-    display_df["_has_status"] +
-    display_df["_has_engagement"]
-)
-
-sort_cols = ["_information_score", "_has_evaluation", "_has_status"]
-sort_orders = [False, False, False]
-
-if "Evaluation" in display_df.columns:
-    sort_cols.append("Evaluation")
-    sort_orders.append(False)
-if "Status" in display_df.columns:
-    sort_cols.append("Status")
-    sort_orders.append(False)
-if "Name" in display_df.columns:
-    sort_cols.append("Name")
-    sort_orders.append(True)
-
-display_df = display_df.sort_values(
-    by=sort_cols,
-    ascending=sort_orders,
-    kind="stable",
-)
-
-display_df = display_df.drop(
-    columns=["_has_evaluation", "_has_status", "_has_engagement", "_information_score"]
-)
-
-# Only after sorting, show a dash for genuinely missing values.
-for col in ["Type of Engagement", "Evaluation", "Status"]:
-    if col in display_df.columns:
-        display_df.loc[display_df[col].eq(""), col] = "—"
-
->>>>>>> 939cd2b44818b9fc8768d537634da1d4a86bb90d
 st.dataframe(
     display_df,
     use_container_width=True,
