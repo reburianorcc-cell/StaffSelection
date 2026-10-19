@@ -6,6 +6,8 @@ create table if not exists public.staff_records (
     name text not null default '',
     position text not null default '',
     type_of_engagement text not null default '',
+    sector text not null default '',
+    experience text not null default '',
     evaluation text not null default '',
     status text not null default '',
     project text not null default '',
