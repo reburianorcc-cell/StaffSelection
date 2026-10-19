@@ -1,9 +1,9 @@
-import re
 import streamlit as st
 import pandas as pd
 import io
 import base64
 import time
+import re
 from pathlib import Path
 import tomllib
 from supabase import create_client, Client
@@ -31,8 +31,8 @@ def _logo_data_uri():
 
 LOGO_URI = _logo_data_uri()
 
-USERNAME = "admin"
-PASSWORD = "ocp123"
+USERNAME = st.secrets.get("OCP_ADMIN_USERNAME", "admin")
+PASSWORD = st.secrets.get("OCP_ADMIN_PASSWORD", "ocp123")
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -488,19 +488,6 @@ def normalize_columns(df):
         "POSITION": "Position",
         "DESIGNATION": "Position",
         "JOB TITLE": "Position",
-        "SECTOR": "Sector",
-        "INDUSTRY SECTOR": "Sector",
-        "EXPERIENCE": "Experience",
-        "YEARS OF EXPERIENCE": "Experience",
-        "WORK EXPERIENCE": "Experience",
-        "TOTAL YEAR EXPERIENCE": "Experience",
-        "TOTAL YEAR EXPERIENCES": "Experience",
-        "TOTAL YEARS OF WORK EXPERIENCE": "Experience",
-        "TOTAL YEARS EXPERIENCE": "Experience",
-        "TOTAL YEAR OF EXPERIENCE": "Experience",
-        "TOTAL YEARS OF EXPERIENCE": "Experience",
-        "TOTAL PROFESSIONAL EXPERIENCE": "Experience",
-        "TOTAL WORK EXPERIENCE": "Experience",
         "TYPE OF ENGAGEMENT": "Type of Engagement",
         "ENGAGEMENT": "Type of Engagement",
         "EMPLOYMENT TYPE": "Type of Engagement",
@@ -510,29 +497,39 @@ def normalize_columns(df):
         "STATUS": "Status",
         "PROJECT": "Project",
         "PROJECT NAME": "Project",
+        "FUNDING": "Funding",
+        "FUNDING SOURCE": "Funding",
+        "SECTOR": "Sector",
+        "TOTAL YEAR EXPERIENCE": "Experience",
+        "TOTAL YEARS EXPERIENCE": "Experience",
+        "TOTAL YEARS OF EXPERIENCE": "Experience",
+        "YEARS OF EXPERIENCE": "Experience",
+        "EXPERIENCE": "Experience",
     }
     renamed = {}
     for col in df.columns:
-        key = re.sub(r"\s+", " ", str(col).replace("_", " ").replace("\n", " ").replace("\r", " ").replace("\xa0", " ").strip().upper())
-        key = re.sub(r"[^A-Z0-9 ]", "", key).strip()
+        key = str(col).strip().upper()
         if key in aliases:
             renamed[col] = aliases[key]
     df = df.rename(columns=renamed)
-    if df.columns.duplicated().any():
-        for name in df.columns[df.columns.duplicated()].unique():
-            same = df.loc[:, df.columns == name]
-            df = df.loc[:, df.columns != name]
-            df[name] = same.bfill(axis=1).iloc[:, 0]
     return df
 
 
 def enrich_staff_fields(df):
     """Fill common engagement/evaluation fields when source files use alternate columns."""
     df = df.copy()
-    for col in ["Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project"]:
+    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"]:
         if col not in df.columns:
             df[col] = ""
 
+    engagement_candidates = [
+        c for c in df.columns
+        if c != "Type of Engagement" and (
+            "ENGAGEMENT" in str(c).upper()
+            or "EMPLOYMENT TYPE" in str(c).upper()
+            or "CONTRACT TYPE" in str(c).upper()
+        )
+    ]
     evaluation_candidates = [
         c for c in df.columns
         if c != "Evaluation" and (
@@ -542,6 +539,11 @@ def enrich_staff_fields(df):
         )
     ]
 
+    for c in engagement_candidates:
+        vals = df[c].fillna("").astype(str).str.strip()
+        blank = df["Type of Engagement"].fillna("").astype(str).str.strip().isin(["", "nan", "None"])
+        df.loc[blank & vals.ne("") & vals.ne("nan"), "Type of Engagement"] = vals
+
     for c in evaluation_candidates:
         vals = df[c].fillna("").astype(str).str.strip()
         blank = df["Evaluation"].fillna("").astype(str).str.strip().isin(["", "nan", "None"])
@@ -550,26 +552,12 @@ def enrich_staff_fields(df):
     return df
 
 
-def normalize_evaluation(value):
-    """Map historic Excellent labels to Exceptional without modifying stored legacy rows."""
-    value = str(value or "").strip()
-    if value.casefold() in {"excellent", "exceptional"}:
-        return "Exceptional"
-    if value.casefold() in {"exceed requirements", "exceeds requirements"}:
-        return "Exceed Requirements"
-    return value
-
-
-EVALUATION_OPTIONS = ["Exceptional", "Exceed Requirements"]
-
-
 def find_header(raw):
     """Find the header row in an OCP worksheet."""
-    for i in range(min(len(raw), 60)):
-        vals = [re.sub(r"\s+", " ", str(v).strip().upper()) for v in raw.iloc[i].tolist() if pd.notna(v)]
-        has_name = any(v in {"NAME", "EMPLOYEE NAME", "FULL NAME", "PERSONNEL NAME"} for v in vals)
-        has_position = any(v in {"POSITION", "DESIGNATION", "JOB TITLE"} for v in vals)
-        if has_name and has_position:
+    for i in range(min(len(raw), 25)):
+        vals = [str(v).strip().upper() for v in raw.iloc[i].tolist() if pd.notna(v)]
+        joined = " | ".join(vals)
+        if "NAME" in joined and ("POSITION" in joined or "DESIGNATION" in joined):
             return i
     return 0
 
@@ -606,21 +594,6 @@ def load_upload(uploaded):
             uploaded.seek(0)
             df = pd.read_excel(uploaded, sheet_name=sheet, header=header_row)
             df = normalize_columns(df)
-            # Some source workbooks have a two-line or merged heading.
-            # If the experience heading was split across adjacent rows,
-            # recover its original column by inspecting the raw header cells.
-            if "Experience" not in df.columns:
-                for col_idx in range(raw.shape[1]):
-                    bits = []
-                    for ri in range(max(0, header_row - 1), min(len(raw), header_row + 3)):
-                        v = raw.iat[ri, col_idx]
-                        if pd.notna(v):
-                            bits.append(re.sub(r"\s+", " ", str(v)).strip())
-                    header_text = " ".join(bits).upper()
-                    if "EXPERIENCE" in header_text and ("YEAR" in header_text or "EXPERIENCE" in header_text):
-                        if col_idx < len(df.columns):
-                            df = df.rename(columns={df.columns[col_idx]: "Experience"})
-                            break
             df = enrich_staff_fields(df)
 
             if "Project" not in df.columns or df["Project"].fillna("").astype(str).str.strip().eq("").all():
@@ -638,17 +611,15 @@ def clean_staff(df):
     """Normalize staff fields while preserving meaningful rows."""
     if df is None or df.empty:
         return pd.DataFrame(columns=[
-            "Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project"
+            "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"
         ])
 
     df = df.copy()
-    for col in ["Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project"]:
+    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).str.strip()
         df.loc[df[col].str.lower().isin(["nan", "none"]), col] = ""
-
-    df["Evaluation"] = df["Evaluation"].map(normalize_evaluation)
 
     useful = (df["Name"] != "") | (df["Position"] != "")
     return df[useful].copy()
@@ -699,7 +670,7 @@ def _read_supabase_secrets():
 def fetch_staff_from_supabase():
     """Load the staff records currently stored in Supabase."""
     empty = pd.DataFrame(columns=[
-        "Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project",
+        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project",
         "Source File", "Source Path", "Uploaded At"
     ])
     client = get_supabase_client()
@@ -713,7 +684,7 @@ def fetch_staff_from_supabase():
         while True:
             result = (
                 client.table("staff_records")
-                .select("name,position,sector,experience,evaluation,status,project,source_file,source_path,uploaded_at")
+                .select("name,position,type_of_engagement,evaluation,status,project,funding,sector,experience,source_file,source_path,uploaded_at")
                 .range(start, start + page_size - 1)
                 .execute()
             )
@@ -729,11 +700,13 @@ def fetch_staff_from_supabase():
         df = pd.DataFrame(rows).rename(columns={
             "name": "Name",
             "position": "Position",
-            "sector": "Sector",
-            "experience": "Experience",
+            "type_of_engagement": "Type of Engagement",
             "evaluation": "Evaluation",
             "status": "Status",
             "project": "Project",
+            "funding": "Funding",
+            "sector": "Sector",
+            "experience": "Experience",
             "source_file": "Source File",
             "source_path": "Source Path",
             "uploaded_at": "Uploaded At",
@@ -800,7 +773,7 @@ def upload_staff_to_supabase(uploaded, parsed_df):
     while True:
         result = (
             client.table("staff_records")
-            .select("id,name,position,sector,experience,evaluation,status,project,source_file,source_path")
+            .select("id,name,position,type_of_engagement,evaluation,status,project,funding,sector,experience,source_file,source_path")
             .range(start, start + page_size - 1)
             .execute()
         )
@@ -818,26 +791,9 @@ def upload_staff_to_supabase(uploaded, parsed_df):
         start += page_size
 
     source = parsed_df[[
-        "Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project"
+        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"
     ]].copy()
     source = source.fillna("").astype(str)
-
-    # Combine duplicate staff/project rows, preserving populated fields.
-    # This prevents an earlier blank experience from masking a later value.
-    merged = {}
-    for _, source_row in source.iterrows():
-        entry = source_row.to_dict()
-        key = _dedupe_key(entry.get("Name"), entry.get("Position"), entry.get("Project"))
-        if not key[0]:
-            continue
-        if key not in merged:
-            merged[key] = entry
-        else:
-            for field in ("Sector", "Experience", "Evaluation", "Status"):
-                if str(entry.get(field, "")).strip() and not str(merged[key].get(field, "")).strip():
-                    merged[key][field] = entry[field]
-    duplicate_rows_merged = len(source) - len(merged)
-    source = pd.DataFrame(list(merged.values()), columns=source.columns)
 
     def norm(value):
         if value is None or pd.isna(value):
@@ -855,8 +811,7 @@ def upload_staff_to_supabase(uploaded, parsed_df):
     for _, row in source.iterrows():
         name = str(row["Name"]).strip()
         position = str(row["Position"]).strip()
-        sector = str(row["Sector"]).strip()
-        experience = str(row["Experience"]).strip()
+        engagement = str(row["Type of Engagement"]).strip()
         evaluation = str(row["Evaluation"]).strip()
         status = str(row["Status"]).strip()
         project = str(row["Project"]).strip()
@@ -877,11 +832,13 @@ def upload_staff_to_supabase(uploaded, parsed_df):
             new_records.append({
                 "name": name,
                 "position": position,
-                "sector": sector,
-                "experience": experience,
+                "type_of_engagement": engagement,
                 "evaluation": evaluation,
                 "status": status,
                 "project": project,
+                "funding": str(row["Funding"]).strip(),
+                "sector": str(row["Sector"]).strip(),
+                "experience": str(row["Experience"]).strip(),
                 "source_file": filename,
                 "source_path": storage_path,
                 "uploaded_at": uploaded_at,
@@ -890,14 +847,16 @@ def upload_staff_to_supabase(uploaded, parsed_df):
 
         # Existing employee/project: compare fields that are allowed to change.
         changes = {}
-        if sector and norm(existing.get("sector")) != norm(sector):
-            changes["sector"] = sector
-        if experience and norm(existing.get("experience")) != norm(experience):
-            changes["experience"] = experience
-        if evaluation and norm(existing.get("evaluation")) != norm(evaluation):
+        if norm(existing.get("type_of_engagement")) != norm(engagement):
+            changes["type_of_engagement"] = engagement
+        if norm(existing.get("evaluation")) != norm(evaluation):
             changes["evaluation"] = evaluation
-        if status and norm(existing.get("status")) != norm(status):
+        if norm(existing.get("status")) != norm(status):
             changes["status"] = status
+        for db_col, source_col in [("funding", "Funding"), ("sector", "Sector"), ("experience", "Experience")]:
+            new_value = str(row[source_col]).strip()
+            if new_value and norm(existing.get(db_col)) != norm(new_value):
+                changes[db_col] = new_value
 
         if changes:
             # Record where the latest values came from.
@@ -940,14 +899,14 @@ def upload_staff_to_supabase(uploaded, parsed_df):
         "updated": updated,
         "unchanged": unchanged,
         "skipped_existing": unchanged,  # backward-compatible key
-        "skipped_upload_duplicates": skipped_upload_duplicates + duplicate_rows_merged,
+        "skipped_upload_duplicates": skipped_upload_duplicates,
     }
 
 def fetch_staff_for_editor():
     """Load editable staff rows including the database ID."""
     client = get_supabase_client()
     if client is None:
-        return pd.DataFrame(columns=["id", "Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project"])
+        return pd.DataFrame(columns=["id", "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"])
 
     rows = []
     start = 0
@@ -955,7 +914,7 @@ def fetch_staff_for_editor():
     while True:
         result = (
             client.table("staff_records")
-            .select("id,name,position,sector,experience,evaluation,status,project")
+            .select("id,name,position,type_of_engagement,evaluation,status,project,funding,sector,experience")
             .order("id")
             .range(start, start + page_size - 1)
             .execute()
@@ -967,19 +926,19 @@ def fetch_staff_for_editor():
         start += page_size
 
     if not rows:
-        return pd.DataFrame(columns=["id", "Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project"])
+        return pd.DataFrame(columns=["id", "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project"])
 
-    result_df = pd.DataFrame(rows).rename(columns={
+    return pd.DataFrame(rows).rename(columns={
         "name": "Name",
         "position": "Position",
-        "sector": "Sector",
-            "experience": "Experience",
+        "type_of_engagement": "Type of Engagement",
         "evaluation": "Evaluation",
         "status": "Status",
         "project": "Project",
+        "funding": "Funding",
+        "sector": "Sector",
+        "experience": "Experience",
     })
-    result_df["Evaluation"] = result_df["Evaluation"].map(normalize_evaluation)
-    return result_df
 
 
 def save_staff_editor_changes(original_df, edited_df):
@@ -988,15 +947,17 @@ def save_staff_editor_changes(original_df, edited_df):
     if client is None:
         raise RuntimeError("Supabase is not configured.")
 
-    fields = ["Name", "Position", "Sector", "Experience", "Evaluation", "Status", "Project"]
+    fields = ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"]
     db_fields = {
         "Name": "name",
         "Position": "position",
-        "Sector": "sector",
-        "Experience": "experience",
+        "Type of Engagement": "type_of_engagement",
         "Evaluation": "evaluation",
         "Status": "status",
         "Project": "project",
+        "Funding": "funding",
+        "Sector": "sector",
+        "Experience": "experience",
     }
 
     def clean(v):
@@ -1074,7 +1035,7 @@ def staff_editor_dialog():
     # ---------------------------------------------------------
     st.markdown("#### Search & Filter")
 
-    f1, f2, f3, f4, f5 = st.columns([2.0, 1.25, 1.15, 1.5, 1.35])
+    f1, f4, f5 = st.columns([2.0, 1.5, 1.7])
 
     with f1:
         search_name = st.text_input(
@@ -1095,21 +1056,13 @@ def staff_editor_dialog():
         x for x in original["Position"].fillna("").astype(str).str.strip().unique().tolist()
         if x
     )
-    evaluation_values = EVALUATION_OPTIONS
+    evaluation_values = sorted(
+        x for x in original["Evaluation"].fillna("").astype(str).str.strip().unique().tolist()
+        if x
+    )
 
-    with f2:
-        selected_project = st.selectbox(
-            "Project",
-            ["All Projects"] + project_values,
-            key="edit_filter_project",
-        )
-
-    with f3:
-        selected_status = st.selectbox(
-            "Status",
-            ["All Status"] + status_values,
-            key="edit_filter_status",
-        )
+    selected_project = "All Projects"
+    selected_status = "All Status"
 
     with f4:
         selected_position = st.selectbox(
@@ -1119,9 +1072,9 @@ def staff_editor_dialog():
         )
 
     with f5:
-        selected_evaluation = st.selectbox(
+        selected_evaluation = st.multiselect(
             "Evaluation",
-            ["All Evaluations"] + evaluation_values,
+            ["Exceptional", "Exceed Requirements"],
             key="edit_filter_evaluation",
         )
 
@@ -1149,10 +1102,8 @@ def staff_editor_dialog():
             filtered["Position"].fillna("").astype(str).str.strip() == selected_position
         ]
 
-    if selected_evaluation != "All Evaluations":
-        filtered = filtered[
-            filtered["Evaluation"].fillna("").map(normalize_evaluation) == selected_evaluation
-        ]
+    if selected_evaluation:
+        filtered = filtered[filtered["Evaluation"].map(normalize_evaluation).isin(selected_evaluation)]
 
     st.caption(f"Showing {len(filtered):,} of {len(original):,} staff records")
 
@@ -1182,11 +1133,13 @@ def staff_editor_dialog():
             "id": st.column_config.NumberColumn("ID", help="Supabase record ID", width="small"),
             "Name": st.column_config.TextColumn("Name", required=True),
             "Position": st.column_config.TextColumn("Position"),
-            "Sector": st.column_config.TextColumn("Sector"),
-            "Experience": st.column_config.TextColumn("Years of Experience"),
-            "Evaluation": st.column_config.SelectboxColumn("Evaluation", options=EVALUATION_OPTIONS),
+            "Type of Engagement": st.column_config.TextColumn("Type of Engagement"),
+            "Evaluation": st.column_config.TextColumn("Evaluation"),
             "Status": st.column_config.TextColumn("Status"),
             "Project": st.column_config.TextColumn("Project"),
+            "Funding": st.column_config.TextColumn("Funding"),
+            "Sector": st.column_config.TextColumn("Sector"),
+            "Experience": st.column_config.TextColumn("Total Year Experience"),
         },
         height=520,
     )
@@ -1214,7 +1167,8 @@ def staff_editor_dialog():
             st.error(f"Unable to save changes: {exc}")
 
 
-def make_pdf(df, project, status, position, sector, evaluation, search):
+def make_pdf(df, funding, position, evaluations):
+    """Export only visible staff fields and applied filters."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
                             rightMargin=28, leftMargin=28, topMargin=28, bottomMargin=28)
@@ -1222,20 +1176,16 @@ def make_pdf(df, project, status, position, sector, evaluation, search):
     styles["Title"].alignment = TA_CENTER
     story = [
         Paragraph("Oriental Consultants Philippines Inc.", styles["Title"]),
-        Paragraph("Filtered Staff List", styles["Heading2"]), Spacer(1, 8),
-        Paragraph(
-            f"<b>Project:</b> {project} &nbsp; | &nbsp; <b>Status:</b> {status} &nbsp; | &nbsp; "
-            f"<b>Name:</b> {search or 'All'} &nbsp; | &nbsp; <b>Position:</b> {position}<br/>"
-            f"<b>Sector:</b> {sector} &nbsp; | &nbsp; "
-            f"<b>Evaluation:</b> {evaluation} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
-            styles["BodyText"]
-        ), Spacer(1, 14)
+        Paragraph("Filtered Personnel List", styles["Heading2"]), Spacer(1, 8),
+        Paragraph(f"<b>Funding:</b> {funding} &nbsp; | &nbsp; <b>Position:</b> {position} &nbsp; | &nbsp; "
+                  f"<b>Evaluation:</b> {', '.join(evaluations) or 'All'} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
+                  styles["BodyText"]), Spacer(1, 14)
     ]
-    cols = ["Name", "Position", "Sector", "Experience", "Evaluation"]
-    data = [[Paragraph(f"<b>{'Years of Experience' if c == 'Experience' else c}</b>", styles["BodyText"]) for c in cols]]
+    cols = ["Name", "Position", "Sector", "Funding", "Total Year Experience", "Evaluation"]
+    data = [[Paragraph(f"<b>{c}</b>", styles["BodyText"]) for c in cols]]
     for _, r in df[cols].fillna("").iterrows():
         data.append([Paragraph(str(r[c]), styles["BodyText"]) for c in cols])
-    t = Table(data, repeatRows=1, colWidths=[160, 190, 120, 120, 110])
+    t = Table(data, repeatRows=1, colWidths=[140, 170, 115, 105, 105, 125])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9EEF5")),
         ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#D5DAE3")),
@@ -1247,8 +1197,16 @@ def make_pdf(df, project, status, position, sector, evaluation, search):
     ]))
     story.append(t)
     doc.build(story)
-    buffer.seek(0)
     return buffer.getvalue()
+
+
+def normalize_evaluation(value):
+    value = str(value or "").strip()
+    if value.casefold() in {"excellent", "exceptional"}:
+        return "Exceptional"
+    if value.casefold() in {"exceed requirements", "exceeds requirements"}:
+        return "Exceed Requirements"
+    return value
 
 # Login loading transition shown as a floating modal over the login page
 if st.session_state.login_loading and not st.session_state.logged_in:
@@ -1257,7 +1215,7 @@ if st.session_state.login_loading and not st.session_state.logged_in:
     <div class="login-wrap">
       <img src="{LOGO_URI}" alt="OC Philippines" style="width:110px;height:110px;object-fit:contain;margin-bottom:8px;" />
       <div class="login-title">Oriental Consultants Philippines Inc.</div>
-      <div class="login-sub">Employee Evaluation Database Monitoring</div>
+      <div class="login-sub">Employee Database Monitoring</div>
     </div>
     """, unsafe_allow_html=True)
     with st.form("login_loading_background"):
@@ -1286,7 +1244,7 @@ if not st.session_state.logged_in:
     <div class="login-wrap">
       <img src="{LOGO_URI}" alt="OC Philippines" style="width:110px;height:110px;object-fit:contain;margin-bottom:8px;" />
       <div class="login-title">Oriental Consultants Philippines Inc.</div>
-      <div class="login-sub">Employee Evaluation Database Monitoring</div>
+      <div class="login-sub">Employee Database Monitoring</div>
     </div>
     """, unsafe_allow_html=True)
     with st.form("login_form"):
@@ -1294,7 +1252,7 @@ if not st.session_state.logged_in:
         password = st.text_input("Password", type="password", placeholder="Enter password")
         go = st.form_submit_button("Log In", type="primary", use_container_width=True)
         if go:
-            if username == USERNAME and password == PASSWORD:
+            if PASSWORD and username == USERNAME and password == PASSWORD:
                 st.session_state.login_loading = True
                 st.rerun()
             else:
@@ -1319,7 +1277,7 @@ st.markdown(f"""
         </div>
         <div>
             <div class="classic-ocp-title">Oriental Consultants Philippines Inc.</div>
-            <div class="classic-ocp-subtitle">Employee Evaluation Database Monitoring</div>
+            <div class="classic-ocp-subtitle">Employee Database Monitoring</div>
         </div>
     </div>
     <div class="classic-portal-pill">Personnel Selection Portal</div>
@@ -1359,17 +1317,6 @@ with _admin_col:
         if uploaded is not None:
             try:
                 preview = clean_staff(load_upload(uploaded))
-                nonempty_exp = preview["Experience"].astype(str).str.strip().ne("").sum() if "Experience" in preview else 0
-                if nonempty_exp == 0:
-                    st.warning("No Total Year Experience values were detected. Check the Excel header and worksheet layout before uploading.")
-                else:
-                    st.caption(f"Experience values detected: {nonempty_exp:,} of {len(preview):,} staff rows")
-                if nonempty_exp:
-                    st.dataframe(
-                        preview.loc[preview["Experience"].ne(""),
-                                    ["Name", "Position", "Project", "Experience"]].head(12),
-                        use_container_width=True, hide_index=True
-                    )
                 if preview.empty:
                     st.error("No usable staff records were found in this file.")
                 else:
@@ -1383,12 +1330,6 @@ with _admin_col:
                         with st.spinner("Uploading file and saving records to Supabase..."):
                             try:
                                 result = upload_staff_to_supabase(uploaded, preview)
-                                # Read back from Supabase to verify that experience values were persisted.
-                                verified = fetch_staff_from_supabase()
-                                saved_experience = int(verified["Experience"].astype(str).str.strip().ne("").sum()) if not verified.empty else 0
-                                st.session_state["experience_import_verified"] = (
-                                    f"Supabase read-back: {saved_experience:,} records currently have Years of Experience."
-                                )
                                 st.session_state.uploaded_name = uploaded.name
                                 st.session_state.uploaded_df = None
                                 st.success(
@@ -1408,8 +1349,6 @@ with _admin_col:
             except Exception as e:
                 st.error(f"Unable to read file: {e}")
 
-        if st.session_state.get("experience_import_verified"):
-            st.info(st.session_state["experience_import_verified"])
         if st.session_state.uploaded_name:
             st.divider()
             st.caption(f"Latest uploaded file: **{st.session_state.uploaded_name}**")
@@ -1426,110 +1365,126 @@ if active_df.empty:
 
 st.caption(
     (f"Supabase file: {st.session_state.uploaded_name} · " if st.session_state.uploaded_name else "Supabase database · ")
-    + f"Database records: {len(active_df):,}"
-    + (f" across {active_df['Project'].nunique():,} projects." if not active_df.empty and "Project" in active_df.columns else ".")
+    + f"Database records: {len(active_df):,}."
 )
 
-st.markdown('<div class="section-title">Project Selection</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-sub">Select the project and project status you want to review.</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-title">Staff Search & Filters</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-sub">Filter by funding, sector, position group, total years of experience and evaluation.</div>', unsafe_allow_html=True)
 
-p1, p2 = st.columns(2)
-if "Project" in active_df.columns and not active_df.empty:
-    projects = sorted(x for x in active_df["Project"].unique() if x and str(x).lower() != "nan")
-else:
-    projects = []
+filtered = active_df.copy()
+for col in ["Name", "Position", "Sector", "Experience", "Funding", "Project", "Evaluation"]:
+    if col not in filtered.columns:
+        filtered[col] = ""
+    filtered[col] = filtered[col].fillna("").astype(str).str.strip()
 
-with p1:
-    project = st.selectbox("Project", ["All Projects"] + projects)
+# Funding is a separate database field. When it has not been populated yet,
+# show legacy Project values as a temporary fallback, without modifying them.
+filtered["Funding Display"] = filtered["Funding"].where(
+    filtered["Funding"].ne(""), filtered["Project"]
+)
+filtered["Evaluation Display"] = filtered["Evaluation"].map(normalize_evaluation)
 
-if "Project" in active_df.columns and project != "All Projects":
-    project_df = active_df[active_df["Project"] == project]
-else:
-    project_df = active_df.copy()
+def position_family(value):
+    """Normalize position variants for filtering, without modifying stored titles.
 
-if "Status" in project_df.columns and not project_df.empty:
-    statuses = sorted(x for x in project_df["Status"].unique() if x and str(x).lower() != "nan")
-else:
-    statuses = []
+    Case, whitespace, grade suffixes and BIM Captain descriptions are ignored.
+    """
+    value = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not value or value.lower() in {"nan", "none"}:
+        return ""
+    value = re.sub(r"\s*\([^)]*\)", "", value).strip()
+    value = re.sub(r"\s+(?:level|grade)\s*[-:]?\s*\d+\s*$", "", value, flags=re.I)
+    value = re.sub(r"\s+\d+\s*$", "", value).strip()
+    value = re.sub(r"\s+for\s+(?:CP\s*\d+|project\b).*$", "", value, flags=re.I).strip()
+    # Use a case-insensitive matching key: 'BIM captain' == 'BIM Captain'.
+    return value.casefold()
 
-with p2:
-    status = st.selectbox("Status", ["All Status"] + statuses)
 
-filtered = project_df.copy()
-if "Status" in filtered.columns and status != "All Status":
-    filtered = filtered[filtered["Status"] == status]
+def position_label(key):
+    """Display one consistently capitalized label for each matching key."""
+    words = key.split()
+    acronyms = {"bim", "cad", "mep", "qa", "qc", "it", "hr", "gis", "hse"}
+    return " ".join(w.upper() if w in acronyms else w.capitalize() for w in words)
+
 
 def experience_years(value):
-    """Extract years from values such as 12, '12 years', '20+ years'."""
-    if value is None or pd.isna(value):
-        return None
-    match = re.search(r"\d+(?:\.\d+)?", str(value).replace(",", ""))
+    """Read numeric Excel/Supabase values, including '15 years' or '20+'."""
+    match = re.search(r"\d+(?:\.\d+)?", str(value or ""))
     return float(match.group()) if match else None
 
 
-def filter_by_experience(frame, selection):
-    if selection == "All Experience":
-        return frame
-    years = frame["Experience"].map(experience_years)
-    if selection == "Below 10 years":
-        mask = years < 10
-    elif selection == "10–19 years":
-        mask = years.between(10, 20, inclusive="left")
-    else:  # 20+ years
-        mask = years >= 20
-    return frame.loc[mask.fillna(False)]
+# Limit the visible dropdown list height without limiting searchable choices.
+st.markdown("""
+<style>
+/* Streamlit selectbox menu: compact, scrollable list */
+div[data-baseweb="popover"] div[data-baseweb="menu"] {
+    max-height: 220px !important;
+    overflow-y: auto !important;
+}
+</style>
+""", unsafe_allow_html=True)
 
+filtered["Position Group"] = filtered["Position"].map(position_family)
 
-st.markdown('<div class="section-title" style="margin-top:12px">Staff Search & Filters</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-sub">Choose any filter below. The staff list updates automatically.</div>', unsafe_allow_html=True)
-
-c1, c2, c3, c4 = st.columns([1.35, 1.2, 1, 1.1])
+c1, c2, c3 = st.columns(3)
 with c1:
-    search = st.text_input("Name", placeholder="Search employee name")
+    funding_options = sorted(x for x in filtered["Funding Display"].unique() if x)
+    funding = st.selectbox("Funding", ["All Funding"] + funding_options)
 with c2:
-    positions = sorted(x for x in filtered["Position"].unique() if x and str(x).lower() != "nan")
-    position = st.selectbox("Position", ["All Positions"] + positions)
+    sector_options = sorted(x for x in filtered["Sector"].unique() if x and x != "—")
+    sector = st.selectbox("Sector", ["All Sectors"] + sector_options)
 with c3:
-    sectors = sorted(x for x in filtered["Sector"].unique() if x and str(x).lower() != "nan")
-    sector = st.selectbox("Sector", ["All Sectors"] + sectors)
+    position_keys = sorted((x for x in filtered["Position Group"].unique() if x), key=str.casefold)
+    position_options = {position_label(key): key for key in position_keys}
+    position = st.selectbox("Position", ["All Positions"] + list(position_options),
+                            help="Similar job titles are grouped. Selecting BIM Captain includes BIM Captain 1, BIM Captain 2 (Revit/Autocad), etc.")
+
+c4, c5 = st.columns([1, 2])
 with c4:
-    evaluation = st.selectbox("Evaluation", ["All Evaluations"] + EVALUATION_OPTIONS)
+    experience_range = st.selectbox(
+        "Total Years of Experience",
+        ["All Years", "10–15 years", "20+ years"],
+    )
+with c5:
+    evaluations = st.multiselect(
+        "Evaluation",
+        options=["Exceptional", "Exceed Requirements"],
+        default=[],
+        help="Select either or both categories. Leave empty to show all evaluations.",
+    )
 
-if search:
-    filtered = filtered[filtered["Name"].str.contains(search, case=False, na=False, regex=False)]
-if position != "All Positions":
-    filtered = filtered[filtered["Position"] == position]
+if funding != "All Funding":
+    filtered = filtered[filtered["Funding Display"].eq(funding)]
 if sector != "All Sectors":
-    filtered = filtered[filtered["Sector"] == sector]
-filtered = filtered.copy()
-filtered["Evaluation"] = filtered["Evaluation"].map(normalize_evaluation)
-if evaluation != "All Evaluations":
-    filtered = filtered[filtered["Evaluation"] == evaluation]
+    filtered = filtered[filtered["Sector"].eq(sector)]
+if position != "All Positions":
+    filtered = filtered[filtered["Position Group"].eq(position_options[position])]
+if experience_range != "All Years":
+    years = filtered["Experience"].map(experience_years)
+    if experience_range == "10–15 years":
+        filtered = filtered[years.between(10, 15, inclusive="both")]
+    elif experience_range == "20+ years":
+        filtered = filtered[years.ge(20)]
+if evaluations:
+    filtered = filtered[filtered["Evaluation Display"].isin(evaluations)]
 
-experience_selection = st.selectbox(
-    "Total Years of Experience",
-    ["All Experience", "Below 10 years", "10–19 years", "20+ years"],
-    help="Filters total years of professional experience, including entries such as '15 years' or '20+ years'.",
-)
-filtered = filter_by_experience(filtered, experience_selection)
+display_df = filtered[["Name", "Position", "Sector", "Funding Display", "Experience", "Evaluation Display"]].copy()
+display_df = display_df.rename(columns={
+    "Funding Display": "Funding", "Experience": "Total Year Experience", "Evaluation Display": "Evaluation"
+})
+for col in display_df.columns:
+    display_df[col] = display_df[col].replace({"": "—", "nan": "—", "None": "—"})
+display_df = display_df.sort_values("Name", kind="stable")
 
 r1, r2 = st.columns([4, 1.25])
 with r1:
     st.markdown(f'<div class="section-title" style="margin-top:8px">{len(filtered):,} Staff Found</div>', unsafe_allow_html=True)
 with r2:
     if not filtered.empty:
-        pdf = make_pdf(filtered, project, status, position, sector, evaluation, search)
+        pdf = make_pdf(display_df, funding, position, evaluations)
         st.download_button("Download Filtered PDF", pdf, "OCP_Filtered_Staff_List.pdf",
                            "application/pdf", use_container_width=True)
 
-display_df = filtered[["Name", "Position", "Sector", "Experience", "Evaluation"]].copy()
-for col in display_df.columns:
-    display_df[col] = display_df[col].fillna("").astype(str).str.strip()
-display_df["Evaluation"] = display_df["Evaluation"].map(normalize_evaluation)
-rank = {"Exceptional": 0, "Exceed Requirements": 1}
-display_df["_evaluation_rank"] = display_df["Evaluation"].map(rank).fillna(2)
-display_df = display_df.sort_values(["_evaluation_rank", "Name"], ascending=[True, True], kind="stable").drop(columns="_evaluation_rank")
-display_df = display_df.replace("", "—")
 st.dataframe(
     display_df,
     use_container_width=True,
@@ -1539,7 +1494,8 @@ st.dataframe(
         "Name": st.column_config.TextColumn("Name", width="medium"),
         "Position": st.column_config.TextColumn("Position", width="large"),
         "Sector": st.column_config.TextColumn("Sector", width="medium"),
-        "Experience": st.column_config.TextColumn("Years of Experience", width="medium"),
+        "Funding": st.column_config.TextColumn("Funding", width="medium"),
+        "Total Year Experience": st.column_config.TextColumn("Total Year Experience", width="medium"),
         "Evaluation": st.column_config.TextColumn("Evaluation", width="medium"),
     },
 )
