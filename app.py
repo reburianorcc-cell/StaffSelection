@@ -1369,7 +1369,7 @@ st.caption(
 )
 
 st.markdown('<div class="section-title">Staff Search & Filters</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-sub">Filter by funding, sector, position group, total years of experience and evaluation.</div>', unsafe_allow_html=True)
+st.markdown('<div class="section-sub">Filter by funding, sector, position group, minimum years of experience and evaluation.</div>', unsafe_allow_html=True)
 
 filtered = active_df.copy()
 for col in ["Name", "Position", "Sector", "Experience", "Funding", "Project", "Evaluation"]:
@@ -1500,10 +1500,18 @@ with c3:
 
 c4, c5 = st.columns([1, 2])
 with c4:
-    experience_range = st.selectbox(
-        "Total Years of Experience",
-        ["All Years", "10–15 years", "20+ years"],
+    # A zero threshold means all staff, including those with no recorded experience.
+    # Higher thresholds show everyone meeting the minimum experience requirement.
+    experience_min = st.slider(
+        "Minimum Years of Experience",
+        min_value=0,
+        max_value=40,
+        value=0,
+        step=1,
+        format="%d years",
+        help="0 = all staff. Move the slider to show staff with at least the selected number of years (e.g., 15 includes 16, 19, 20 and 30).",
     )
+    st.caption("All experience levels" if experience_min == 0 else f"{experience_min}+ years of experience")
 with c5:
     evaluations = st.multiselect(
         "Evaluation",
@@ -1518,12 +1526,9 @@ if sector != "All Sectors":
     filtered = filtered[filtered["Sector"].eq(sector)]
 if position != "All Positions":
     filtered = filtered[filtered["Position Group"].eq(position_options[position])]
-if experience_range != "All Years":
+if experience_min > 0:
     years = filtered["Experience"].map(experience_years)
-    if experience_range == "10–15 years":
-        filtered = filtered[years.between(10, 15, inclusive="both")]
-    elif experience_range == "20+ years":
-        filtered = filtered[years.ge(20)]
+    filtered = filtered[years.ge(experience_min)]
 if evaluations:
     filtered = filtered[filtered["Evaluation Display"].isin(evaluations)]
 
