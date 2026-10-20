@@ -1385,26 +1385,82 @@ filtered["Funding Display"] = filtered["Funding"].where(
 filtered["Evaluation Display"] = filtered["Evaluation"].map(normalize_evaluation)
 
 def position_family(value):
-    """Normalize position variants for filtering, without modifying stored titles.
-
-    Case, whitespace, grade suffixes and BIM Captain descriptions are ignored.
-    """
-    value = re.sub(r"\s+", " ", str(value or "")).strip()
-    if not value or value.lower() in {"nan", "none"}:
+    """Normalize spelling, punctuation and grades for *filtering only*."""
+    value = re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+    if value in {"", "nan", "none", "null", "—"}:
         return ""
-    value = re.sub(r"\s*\([^)]*\)", "", value).strip()
-    value = re.sub(r"\s+(?:level|grade)\s*[-:]?\s*\d+\s*$", "", value, flags=re.I)
-    value = re.sub(r"\s+\d+\s*$", "", value).strip()
-    value = re.sub(r"\s+for\s+(?:CP\s*\d+|project\b).*$", "", value, flags=re.I).strip()
-    # Use a case-insensitive matching key: 'BIM captain' == 'BIM Captain'.
-    return value.casefold()
+    value = re.sub(r"\s*&\s*", " and ", value)
+    value = re.sub(r"[^\w\s]", " ", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    corrections = {
+        "adminstrator": "administrator", "administrater": "administrator",
+        "administator": "administrator", "adminitrator": "administrator",
+        "asistant": "assistant", "assitant": "assistant",
+        "assisstant": "assistant", "assistent": "assistant",
+        "adminstrative": "administrative", "administrativ": "administrative",
+        "coordiantor": "coordinator", "coodinator": "coordinator",
+        "compilationn": "compilation", "captian": "captain",
+        "enginer": "engineer", "engneer": "engineer",
+        "mananger": "manager", "manger": "manager",
+        "architecht": "architect", "architech": "architect",
+        "acountant": "accountant", "accoutant": "accountant",
+    }
+    value = " ".join(corrections.get(w, w) for w in value.split())
+    value = re.sub(r"\s+(?:level|grade)\s*\d+\s*$", "", value)
+    value = re.sub(r"\s+\d+\s*$", "", value)
+    value = re.sub(r"\s+for\s+(?:cp\s*\d+|project\b).*$", "", value)
+    value = re.sub(r"^(bim captain)\s+(?:revit|autocad).*$", r"\1", value)
+    return value.strip()
 
 
 def position_label(key):
-    """Display one consistently capitalized label for each matching key."""
-    words = key.split()
-    acronyms = {"bim", "cad", "mep", "qa", "qc", "it", "hr", "gis", "hse"}
-    return " ".join(w.upper() if w in acronyms else w.capitalize() for w in words)
+    acronyms = {"bim", "cad", "mep", "qa", "qc", "it", "hr", "gis", "hse", "hvac"}
+    return " ".join(w.upper() if w in acronyms else w.capitalize() for w in key.split())
+
+
+def build_position_groups(position_values):
+    """Deduplicate across the entire staff dataset, not just a typed example.
+
+    Conservative fuzzy matching fixes near-identical typos, but does not
+    collapse distinct roles such as BIM Electrical vs BIM Mechanical.
+    """
+    from difflib import SequenceMatcher
+    keys = sorted({position_family(v) for v in position_values if position_family(v)},
+                  key=lambda k: (len(k), k))
+    parent = {k: k for k in keys}
+
+    def root(k):
+        while parent[k] != k:
+            parent[k] = parent[parent[k]]
+            k = parent[k]
+        return k
+
+    # Restrict fuzzy matches to similar word counts and matching key terms.
+    # Avoid generic substring matching, which merges unrelated occupations.
+    for i, left in enumerate(keys):
+        lw = left.split()
+        for right in keys[i + 1:]:
+            rw = right.split()
+            if abs(len(left) - len(right)) > 3 or len(lw) != len(rw):
+                continue
+            if lw[0][0] != rw[0][0]:
+                continue
+            if len(lw) > 1 and lw[-1] != rw[-1] and SequenceMatcher(None, lw[-1], rw[-1]).ratio() < .88:
+                continue
+            similarity = SequenceMatcher(None, left, right).ratio()
+            if similarity >= .94:
+                parent[root(right)] = root(left)
+
+    groups = {}
+    for key in keys:
+        groups.setdefault(root(key), []).append(key)
+    canonical = {}
+    for variants in groups.values():
+        # Favor cleanest/shortest spelling for the visible label.
+        chosen = sorted(variants, key=lambda v: (len(v), v))[0]
+        for v in variants:
+            canonical[v] = chosen
+    return canonical
 
 
 def experience_years(value):
@@ -1424,7 +1480,10 @@ div[data-baseweb="popover"] div[data-baseweb="menu"] {
 </style>
 """, unsafe_allow_html=True)
 
-filtered["Position Group"] = filtered["Position"].map(position_family)
+position_group_map = build_position_groups(filtered["Position"].unique())
+filtered["Position Group"] = filtered["Position"].map(
+    lambda v: position_group_map.get(position_family(v), "")
+)
 
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -1437,7 +1496,7 @@ with c3:
     position_keys = sorted((x for x in filtered["Position Group"].unique() if x), key=str.casefold)
     position_options = {position_label(key): key for key in position_keys}
     position = st.selectbox("Position", ["All Positions"] + list(position_options),
-                            help="Similar job titles are grouped. Selecting BIM Captain includes BIM Captain 1, BIM Captain 2 (Revit/Autocad), etc.")
+                            help="Similar positions are grouped across spelling, capitalization, &/and, punctuation, and numbered levels. Original employee positions are preserved.")
 
 c4, c5 = st.columns([1, 2])
 with c4:
