@@ -1363,14 +1363,6 @@ if active_df.empty:
     st.info("No staff records are stored in Supabase. Open **Admin ▾** and upload an Excel or CSV file.")
 
 
-st.caption(
-    (f"Supabase file: {st.session_state.uploaded_name} · " if st.session_state.uploaded_name else "Supabase database · ")
-    + f"Database records: {len(active_df):,}."
-)
-
-st.markdown('<div class="section-title">Staff Search & Filters</div>', unsafe_allow_html=True)
-st.markdown('<div class="section-sub">Filter by funding, sector, position group, minimum years of experience and evaluation.</div>', unsafe_allow_html=True)
-
 filtered = active_df.copy()
 for col in ["Name", "Position", "Sector", "Experience", "Funding", "Project", "Evaluation"]:
     if col not in filtered.columns:
