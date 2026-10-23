@@ -5,6 +5,7 @@ import base64
 import time
 import re
 from pathlib import Path
+from xml.sax.saxutils import escape
 import tomllib
 from supabase import create_client, Client
 from reportlab.lib import colors
@@ -1167,7 +1168,7 @@ def staff_editor_dialog():
             st.error(f"Unable to save changes: {exc}")
 
 
-def make_pdf(df, funding, position, evaluations):
+def make_pdf(df, funding, position, evaluations, current_project):
     """Export only visible staff fields and applied filters."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
@@ -1177,8 +1178,10 @@ def make_pdf(df, funding, position, evaluations):
     story = [
         Paragraph("Oriental Consultants Philippines Inc.", styles["Title"]),
         Paragraph("Filtered Personnel List", styles["Heading2"]), Spacer(1, 8),
-        Paragraph(f"<b>Funding:</b> {funding} &nbsp; | &nbsp; <b>Position:</b> {position} &nbsp; | &nbsp; "
-                  f"<b>Evaluation:</b> {', '.join(evaluations) or 'All'} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
+        Paragraph(f"<b>Current Project:</b> {escape(current_project)}", styles["BodyText"]),
+        Spacer(1, 5),
+        Paragraph(f"<b>Funding:</b> {escape(funding)} &nbsp; | &nbsp; <b>Position:</b> {escape(position)} &nbsp; | &nbsp; "
+                  f"<b>Evaluation:</b> {escape(', '.join(evaluations) or 'All')} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
                   styles["BodyText"]), Spacer(1, 14)
     ]
     cols = ["Name", "Position", "Sector", "Funding", "Total Year Experience", "Evaluation"]
@@ -1464,6 +1467,23 @@ def experience_years(value):
 # Limit the visible dropdown list height without limiting searchable choices.
 st.markdown("""
 <style>
+/* Match the Sector selector to Funding and Position (same soft-gray field). */
+div[data-testid="stSelectbox"].st-key-sector_dropdown [data-baseweb="select"] > div,
+.st-key-sector_dropdown div[data-baseweb="select"] > div {
+    background-color:#f0f3f7 !important;
+    border:1px solid #e5eaf0 !important;
+    border-radius:10px !important;
+    min-height:49px !important;
+    box-shadow:none !important;
+}
+.st-key-sector_dropdown div[data-baseweb="select"] > div:hover {
+    background-color:#edf1f6 !important;
+    border-color:#dce3ec !important;
+}
+.st-key-sector_dropdown div[data-baseweb="select"] input,
+.st-key-sector_dropdown div[data-baseweb="select"] [data-testid="stMarkdownContainer"] {
+    text-align:left !important;
+}
 /* Streamlit selectbox menu: compact, scrollable list */
 div[data-baseweb="popover"] div[data-baseweb="menu"] {
     max-height: 220px !important;
@@ -1477,25 +1497,93 @@ filtered["Position Group"] = filtered["Position"].map(
     lambda v: position_group_map.get(position_family(v), "")
 )
 
+def sector_parts(value):
+    """Interpret existing Sector text as Main > Child; no schema change."""
+    return [part.strip() for part in str(value or "").split(">") if part.strip()]
+
+
+def sector_matches(value, selected):
+    """Parent includes descendants; child matches its exact hierarchical path."""
+    if not selected:
+        return True
+    parts = sector_parts(value)
+    selected_parts = sector_parts(selected)
+    return [p.casefold() for p in parts[:len(selected_parts)]] == [p.casefold() for p in selected_parts]
+
+
 c1, c2, c3 = st.columns(3)
 with c1:
     funding_options = sorted(x for x in filtered["Funding Display"].unique() if x)
     funding = st.selectbox("Funding", ["All Funding"] + funding_options)
 with c2:
-    sector_options = sorted(x for x in filtered["Sector"].unique() if x and x != "—")
-    sector = st.selectbox("Sector", ["All Sectors"] + sector_options)
+    # One expandable sector control, populated dynamically from Supabase data.
+    # Supports values like "Railway > Civil Structural" without a new column.
+    sector_paths = {}
+    for raw_sector in filtered["Sector"].unique():
+        parts = sector_parts(raw_sector)
+        if parts and parts[0].casefold() not in {"nan", "none", "—"}:
+            main = parts[0]
+            entry = sector_paths.setdefault(main.casefold(), {"name": main, "children": {}})
+            if len(parts) > 1:
+                full_path = " > ".join(parts)
+                entry["children"].setdefault(full_path.casefold(), full_path)
+
+    # Native selectbox preserves the original three-column filter layout.
+    # Selecting a main sector opens its related categories in this SAME dropdown.
+    if "selected_sector_path" not in st.session_state:
+        st.session_state.selected_sector_path = ""
+    if "sector_expanded_main" not in st.session_state:
+        st.session_state.sector_expanded_main = ""
+
+    expanded_main = st.session_state.sector_expanded_main
+    options = ["All Sectors"]
+    if expanded_main and expanded_main.casefold() in sector_paths:
+        group = sector_paths[expanded_main.casefold()]
+        main_name = group["name"]
+        options += ["← All main sectors", main_name]
+        options += sorted(group["children"].values(), key=str.casefold)
+    else:
+        st.session_state.sector_expanded_main = ""
+        options += [v["name"] for v in sorted(sector_paths.values(), key=lambda g: g["name"].casefold())]
+
+    selected_path = st.session_state.selected_sector_path
+    current_option = selected_path if selected_path in options else "All Sectors"
+    def on_sector_change():
+        choice = st.session_state.sector_dropdown
+        if choice == "← All main sectors":
+            st.session_state.sector_expanded_main = ""
+            st.session_state.selected_sector_path = ""
+        elif choice == "All Sectors":
+            st.session_state.sector_expanded_main = ""
+            st.session_state.selected_sector_path = ""
+        elif choice.casefold() in sector_paths:
+            st.session_state.sector_expanded_main = choice
+            st.session_state.selected_sector_path = choice
+        else:
+            st.session_state.selected_sector_path = choice
+
+    # When the option list changes, sync the widget key before constructing it.
+    if st.session_state.get("sector_dropdown") not in options:
+        st.session_state.sector_dropdown = current_option
+    sector = st.session_state.selected_sector_path
+    st.selectbox(
+        "Sector", options, key="sector_dropdown", on_change=on_sector_change,
+        help="Select a main sector to reveal its categories. Select a full path to filter that category; selecting the main sector includes all related categories.",
+    )
+    sector = st.session_state.selected_sector_path
+
 with c3:
     position_keys = sorted((x for x in filtered["Position Group"].unique() if x), key=str.casefold)
     position_options = {position_label(key): key for key in position_keys}
     position = st.selectbox("Position", ["All Positions"] + list(position_options),
                             help="Similar positions are grouped across spelling, capitalization, &/and, punctuation, and numbered levels. Original employee positions are preserved.")
 
-c4, c5 = st.columns([1, 2])
+c4, c5, c6 = st.columns(3)
 with c4:
     # A zero threshold means all staff, including those with no recorded experience.
     # Higher thresholds show everyone meeting the minimum experience requirement.
     experience_min = st.slider(
-        "Minimum Years of Experience",
+        "Years of Experience",
         min_value=0,
         max_value=40,
         value=0,
@@ -1512,10 +1600,36 @@ with c5:
         help="Select either or both categories. Leave empty to show all evaluations.",
     )
 
+with c6:
+    # Read current projects from the existing Supabase `project` field.
+    # Empty project values are omitted from the dropdown.
+    project_options = sorted(
+        (x for x in filtered["Project"].unique() if x and x != "—"),
+        key=str.casefold,
+    )
+    current_project = st.selectbox(
+        "Current Project",
+        ["All Projects"] + project_options,
+        help="Filter staff by their current project recorded in Supabase.",
+    )
+
+# Default to active staff only. The toggle includes inactive/other-status
+# records without changing any stored Supabase status values.
+show_inactive_staff = st.toggle(
+    "Show inactive staff",
+    value=False,
+    help="Turn ON to include inactive staff and employees with other statuses in the results. Turn OFF to show Active staff only (default). This does not change any employee status in Supabase.",
+    key="show_inactive_staff",
+)
+if not show_inactive_staff:
+    filtered = filtered[
+        filtered["Status"].fillna("").astype(str).str.strip().str.casefold().eq("active")
+    ]
+
 if funding != "All Funding":
     filtered = filtered[filtered["Funding Display"].eq(funding)]
-if sector != "All Sectors":
-    filtered = filtered[filtered["Sector"].eq(sector)]
+if sector:
+    filtered = filtered[filtered["Sector"].map(lambda value: sector_matches(value, sector))]
 if position != "All Positions":
     filtered = filtered[filtered["Position Group"].eq(position_options[position])]
 if experience_min > 0:
@@ -1523,6 +1637,8 @@ if experience_min > 0:
     filtered = filtered[years.ge(experience_min)]
 if evaluations:
     filtered = filtered[filtered["Evaluation Display"].isin(evaluations)]
+if current_project != "All Projects":
+    filtered = filtered[filtered["Project"].eq(current_project)]
 
 display_df = filtered[["Name", "Position", "Sector", "Funding Display", "Experience", "Evaluation Display"]].copy()
 display_df = display_df.rename(columns={
@@ -1534,10 +1650,11 @@ display_df = display_df.sort_values("Name", kind="stable")
 
 r1, r2 = st.columns([4, 1.25])
 with r1:
-    st.markdown(f'<div class="section-title" style="margin-top:8px">{len(filtered):,} Staff Found</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-title" style="margin-top:8px">{len(filtered):,} {"Staff Found" if show_inactive_staff else "Active Staff Found"}</div>', unsafe_allow_html=True)
+    st.caption(f"Current Project: {current_project}")
 with r2:
     if not filtered.empty:
-        pdf = make_pdf(display_df, funding, position, evaluations)
+        pdf = make_pdf(display_df, funding, position, evaluations, current_project)
         st.download_button("Download Filtered PDF", pdf, "OCP_Filtered_Staff_List.pdf",
                            "application/pdf", use_container_width=True)
 
