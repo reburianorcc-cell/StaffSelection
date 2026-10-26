@@ -85,6 +85,51 @@ div[data-testid="stTextInput"] [data-baseweb="input"] {
 }
 div[data-testid="stDataFrame"] {border-radius:14px;overflow:hidden;border:1px solid #e3e9f0;background:#fff;}
 
+/* Compact, aligned inline experience controls; no dropdown. */
+.experience-filter-heading {font-size:14px;color:#092e50;margin:0 0 6px;line-height:1.4;}
+div[data-testid="stCheckbox"] label {font-size:13px !important;}
+div[data-testid="stCheckbox"] {margin:0 !important;}
+div[data-testid="stSlider"] {padding-top:0 !important;}
+/* Experience popover: override Admin popover styles ONLY in this filter. */
+/* Match the Evaluation multiselect's neutral-gray surface, without affecting Admin. */
+.st-key-experience_filter_panel div[data-testid="stPopover"] > button {
+    background:#f0f2f6 !important;
+    color:#17243a !important;
+    border:1px solid transparent !important;
+    min-height:48px !important;
+    height:48px !important;
+    border-radius:10px !important;
+    padding:0 10px !important;
+    font-size:13px !important;
+    font-weight:400 !important;
+    box-shadow:none !important;
+    justify-content:space-between !important;
+    white-space:nowrap !important;
+}
+.st-key-experience_filter_panel div[data-testid="stPopover"] > button:hover {
+    background:#e9edf3 !important;
+    border-color:transparent !important;
+}
+.st-key-experience_filter_panel div[data-testid="stCheckbox"] label {
+    font-size:13px !important;
+    white-space:nowrap;
+}
+/* Give only the experience settings popover a comfortable, responsive width. */
+div[data-baseweb="popover"]:has(.ocp-experience-popover-marker) {
+    width: min(420px, calc(100vw - 32px)) !important;
+    max-width: calc(100vw - 32px) !important;
+}
+div[data-testid="stPopoverBody"]:has(.ocp-experience-popover-marker) {
+    width: min(420px, calc(100vw - 32px)) !important;
+    min-width: min(360px, calc(100vw - 32px)) !important;
+    max-width: calc(100vw - 32px) !important;
+    box-sizing: border-box !important;
+    padding: 18px 20px !important;
+    overflow: visible !important;
+}
+div[data-testid="stPopoverBody"]:has(.ocp-experience-popover-marker) div[data-testid="stSlider"] {
+    width: 100% !important;
+}
 /* Modern responsive evaluation guide */
 .eval-guide {
     background:#ffffff;
@@ -506,6 +551,9 @@ def normalize_columns(df):
         "TOTAL YEARS OF EXPERIENCE": "Experience",
         "YEARS OF EXPERIENCE": "Experience",
         "EXPERIENCE": "Experience",
+        "OVERSEAS": "Overseas Experience",
+        "OVERSEAS EXPERIENCE": "Overseas Experience",
+        "OVERSEAS YEARS": "Overseas Experience",
     }
     renamed = {}
     for col in df.columns:
@@ -612,11 +660,11 @@ def clean_staff(df):
     """Normalize staff fields while preserving meaningful rows."""
     if df is None or df.empty:
         return pd.DataFrame(columns=[
-            "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"
+            "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience"
         ])
 
     df = df.copy()
-    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"]:
+    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience"]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).str.strip()
@@ -712,6 +760,26 @@ def fetch_staff_from_supabase():
             "source_path": "Source Path",
             "uploaded_at": "Uploaded At",
         })
+        # Overseas experience is optional in older Supabase schemas.
+        try:
+            overseas_rows = []
+            offset = 0
+            while True:
+                page = (client.table("staff_records")
+                        .select("name,position,project,overseas_experience")
+                        .range(offset, offset + 999).execute()).data or []
+                overseas_rows.extend(page)
+                if len(page) < 1000:
+                    break
+                offset += 1000
+            overseas_map = {
+                _dedupe_key(r.get("name"), r.get("position"), r.get("project")): r.get("overseas_experience")
+                for r in overseas_rows
+            }
+            df["Overseas Experience"] = df.apply(
+                lambda r: overseas_map.get(_dedupe_key(r.get("Name"), r.get("Position"), r.get("Project")), ""), axis=1)
+        except Exception:
+            df["Overseas Experience"] = ""
         return clean_staff(df)
     except Exception as exc:
         st.session_state.supabase_error = str(exc)
@@ -792,7 +860,7 @@ def upload_staff_to_supabase(uploaded, parsed_df):
         start += page_size
 
     source = parsed_df[[
-        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"
+        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience"
     ]].copy()
     source = source.fillna("").astype(str)
 
@@ -840,6 +908,7 @@ def upload_staff_to_supabase(uploaded, parsed_df):
                 "funding": str(row["Funding"]).strip(),
                 "sector": str(row["Sector"]).strip(),
                 "experience": str(row["Experience"]).strip(),
+                "overseas_experience": (float(row["Overseas Experience"]) if str(row["Overseas Experience"]).strip() not in ("", "nan", "None") else None),
                 "source_file": filename,
                 "source_path": storage_path,
                 "uploaded_at": uploaded_at,
@@ -858,6 +927,18 @@ def upload_staff_to_supabase(uploaded, parsed_df):
             new_value = str(row[source_col]).strip()
             if new_value and norm(existing.get(db_col)) != norm(new_value):
                 changes[db_col] = new_value
+
+        # The Excel column is named "Overseas"; normalize_columns maps it to
+        # "Overseas Experience". Preserve existing values when the cell is blank.
+        overseas_value = str(row["Overseas Experience"]).strip()
+        if overseas_value and overseas_value.lower() not in ("nan", "none"):
+            try:
+                parsed_overseas = float(overseas_value)
+                old_overseas = existing.get("overseas_experience")
+                if old_overseas is None or float(old_overseas) != parsed_overseas:
+                    changes["overseas_experience"] = parsed_overseas
+            except (TypeError, ValueError):
+                pass
 
         if changes:
             # Record where the latest values came from.
@@ -1184,11 +1265,11 @@ def make_pdf(df, funding, position, evaluations, current_project):
                   f"<b>Evaluation:</b> {escape(', '.join(evaluations) or 'All')} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
                   styles["BodyText"]), Spacer(1, 14)
     ]
-    cols = ["Name", "Position", "Sector", "Funding", "Total Year Experience", "Evaluation"]
+    cols = ["Name", "Position", "Sector", "Funding", "Total Year Experience", "Overseas Experience", "Evaluation"]
     data = [[Paragraph(f"<b>{c}</b>", styles["BodyText"]) for c in cols]]
     for _, r in df[cols].fillna("").iterrows():
         data.append([Paragraph(str(r[c]), styles["BodyText"]) for c in cols])
-    t = Table(data, repeatRows=1, colWidths=[140, 170, 115, 105, 105, 125])
+    t = Table(data, repeatRows=1, colWidths=[126, 155, 92, 72, 92, 92, 106])
     t.setStyle(TableStyle([
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9EEF5")),
         ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#D5DAE3")),
@@ -1367,7 +1448,7 @@ if active_df.empty:
 
 
 filtered = active_df.copy()
-for col in ["Name", "Position", "Sector", "Experience", "Funding", "Project", "Evaluation"]:
+for col in ["Name", "Position", "Sector", "Experience", "Overseas Experience", "Funding", "Project", "Evaluation", "Status"]:
     if col not in filtered.columns:
         filtered[col] = ""
     filtered[col] = filtered[col].fillna("").astype(str).str.strip()
@@ -1580,18 +1661,28 @@ with c3:
 
 c4, c5, c6 = st.columns(3)
 with c4:
-    # A zero threshold means all staff, including those with no recorded experience.
-    # Higher thresholds show everyone meeting the minimum experience requirement.
-    experience_min = st.slider(
-        "Years of Experience",
-        min_value=0,
-        max_value=40,
-        value=0,
-        step=1,
-        format="%d years",
-        help="0 = all staff. Move the slider to show staff with at least the selected number of years (e.g., 15 includes 16, 19, 20 and 30).",
-    )
-    st.caption("All experience levels" if experience_min == 0 else f"{experience_min}+ years of experience")
+    st.markdown("<div class='experience-filter-heading'>Years of Experience</div>", unsafe_allow_html=True)
+    # All controls share one compact row. Sliders render in a floating popover,
+    # so toggling either option never increases the filter row height.
+    with st.container(key="experience_filter_panel"):
+        settings_col, total_col, overseas_col = st.columns([1.45, 1.1, 1.25], gap="small", vertical_alignment="center")
+        with settings_col:
+            with st.popover("Years of Experience", use_container_width=True):
+                st.markdown("<span class='ocp-experience-popover-marker'></span>", unsafe_allow_html=True)
+                st.markdown("**Experience requirements**")
+                if st.session_state.get("filter_total_exp", False):
+                    st.slider("Total Experience", 0, 40, 0, 1, key="experience_total_min")
+                if st.session_state.get("filter_overseas_exp", False):
+                    st.slider("Overseas Experience", 0, 40, 0, 1, key="experience_overseas_min")
+                if not (st.session_state.get("filter_total_exp", False) or st.session_state.get("filter_overseas_exp", False)):
+                    st.caption("Select Total or Overseas Experience to enable its slider.")
+        with total_col:
+            filter_total = st.checkbox("Total Experience", value=False, key="filter_total_exp")
+        with overseas_col:
+            filter_overseas = st.checkbox("Overseas Experience", value=False, key="filter_overseas_exp")
+    experience_min = st.session_state.get("experience_total_min", 0) if filter_total else 0
+    overseas_min = st.session_state.get("experience_overseas_min", 0) if filter_overseas else 0
+
 with c5:
     evaluations = st.multiselect(
         "Evaluation",
@@ -1635,12 +1726,15 @@ if position != "All Positions":
 if experience_min > 0:
     years = filtered["Experience"].map(experience_years)
     filtered = filtered[years.ge(experience_min)]
+if filter_overseas and overseas_min > 0:
+    overseas_years = filtered["Overseas Experience"].map(experience_years)
+    filtered = filtered[overseas_years.ge(overseas_min)]
 if evaluations:
     filtered = filtered[filtered["Evaluation Display"].isin(evaluations)]
 if current_project != "All Projects":
     filtered = filtered[filtered["Project"].eq(current_project)]
 
-display_df = filtered[["Name", "Position", "Sector", "Funding Display", "Experience", "Evaluation Display"]].copy()
+display_df = filtered[["Name", "Position", "Sector", "Funding Display", "Experience", "Overseas Experience", "Evaluation Display"]].copy()
 display_df = display_df.rename(columns={
     "Funding Display": "Funding", "Experience": "Total Year Experience", "Evaluation Display": "Evaluation"
 })
@@ -1658,17 +1752,20 @@ with r2:
         st.download_button("Download Filtered PDF", pdf, "OCP_Filtered_Staff_List.pdf",
                            "application/pdf", use_container_width=True)
 
+# Balanced column widths keep all seven fields visible in the main table.
+# Widths are in pixels; the table still stretches to the available page width.
 st.dataframe(
     display_df,
     use_container_width=True,
     hide_index=True,
-    height=500,
+    height=580,
     column_config={
-        "Name": st.column_config.TextColumn("Name", width="medium"),
-        "Position": st.column_config.TextColumn("Position", width="large"),
-        "Sector": st.column_config.TextColumn("Sector", width="medium"),
-        "Funding": st.column_config.TextColumn("Funding", width="medium"),
-        "Total Year Experience": st.column_config.TextColumn("Total Year Experience", width="medium"),
-        "Evaluation": st.column_config.TextColumn("Evaluation", width="medium"),
+        "Name": st.column_config.TextColumn("Name", width=300),
+        "Position": st.column_config.TextColumn("Position", width=315),
+        "Sector": st.column_config.TextColumn("Sector", width=170),
+        "Funding": st.column_config.TextColumn("Funding", width=100),
+        "Total Year Experience": st.column_config.TextColumn("Total Year Experience", width=160),
+        "Overseas Experience": st.column_config.TextColumn("Overseas Experience", width=160),
+        "Evaluation": st.column_config.TextColumn("Evaluation", width=285),
     },
 )
