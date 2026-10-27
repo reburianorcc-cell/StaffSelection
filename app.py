@@ -7,6 +7,11 @@ import re
 from pathlib import Path
 from xml.sax.saxutils import escape
 import tomllib
+import unicodedata
+import hashlib
+import zipfile
+from urllib.parse import quote
+from datetime import datetime, timezone
 from supabase import create_client, Client
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
@@ -523,6 +528,17 @@ div[data-testid="stPopoverBody"] .stButton > button{
 # FILE UPLOAD / STAFF DATABASE
 # ============================================================
 
+def parse_contract_date(value):
+    """Return YYYY-MM-DD for Supabase DATE; leave empty cells unset."""
+    if value is None or str(value).strip().lower() in ("", "nan", "none", "nat"):
+        return None
+    try:
+        parsed = pd.to_datetime(value, errors="coerce")
+        return parsed.date().isoformat() if not pd.isna(parsed) else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
 def normalize_columns(df):
     """Normalize common column names from OCP Excel/CSV files."""
     df = df.copy()
@@ -543,6 +559,9 @@ def normalize_columns(df):
         "STATUS": "Status",
         "PROJECT": "Project",
         "PROJECT NAME": "Project",
+        "CURRENT PROJECT": "Project",
+        "ELIGIBILITY": "Eligibility",
+        "PROFESSIONAL ELIGIBILITY": "Eligibility",
         "FUNDING": "Funding",
         "FUNDING SOURCE": "Funding",
         "SECTOR": "Sector",
@@ -554,6 +573,9 @@ def normalize_columns(df):
         "OVERSEAS": "Overseas Experience",
         "OVERSEAS EXPERIENCE": "Overseas Experience",
         "OVERSEAS YEARS": "Overseas Experience",
+        "END OF CONTRACT": "End of Contract",
+        "CONTRACT END DATE": "End of Contract",
+        "CONTRACT EXPIRY": "End of Contract",
     }
     renamed = {}
     for col in df.columns:
@@ -660,11 +682,11 @@ def clean_staff(df):
     """Normalize staff fields while preserving meaningful rows."""
     if df is None or df.empty:
         return pd.DataFrame(columns=[
-            "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience"
+            "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience", "End of Contract", "Eligibility"
         ])
 
     df = df.copy()
-    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience"]:
+    for col in ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience", "End of Contract", "Eligibility"]:
         if col not in df.columns:
             df[col] = ""
         df[col] = df[col].fillna("").astype(str).str.strip()
@@ -780,11 +802,287 @@ def fetch_staff_from_supabase():
                 lambda r: overseas_map.get(_dedupe_key(r.get("Name"), r.get("Position"), r.get("Project")), ""), axis=1)
         except Exception:
             df["Overseas Experience"] = ""
+        # Optional date column: older Supabase schemas may not have it yet.
+        try:
+            contract_rows = []
+            offset = 0
+            while True:
+                page = (client.table("staff_records")
+                        .select("name,position,project,end_of_contract")
+                        .range(offset, offset + 999).execute()).data or []
+                contract_rows.extend(page)
+                if len(page) < 1000:
+                    break
+                offset += 1000
+            contract_map = {
+                _dedupe_key(r.get("name"), r.get("position"), r.get("project")): r.get("end_of_contract")
+                for r in contract_rows
+            }
+            df["End of Contract"] = df.apply(
+                lambda r: contract_map.get(_dedupe_key(r.get("Name"), r.get("Position"), r.get("Project"))) or "", axis=1)
+        except Exception:
+            df["End of Contract"] = ""
+        # Eligibility is optional for older databases; keep the table usable until SQL is run.
+        try:
+            eligibility_rows = []
+            offset = 0
+            while True:
+                page = (client.table("staff_records")
+                        .select("name,position,project,eligibility")
+                        .range(offset, offset + 999).execute()).data or []
+                eligibility_rows.extend(page)
+                if len(page) < 1000:
+                    break
+                offset += 1000
+            eligibility_map = {
+                _dedupe_key(r.get("name"), r.get("position"), r.get("project")): r.get("eligibility")
+                for r in eligibility_rows
+            }
+            df["Eligibility"] = df.apply(
+                lambda r: eligibility_map.get(_dedupe_key(r.get("Name"), r.get("Position"), r.get("Project"))) or "", axis=1)
+        except Exception:
+            df["Eligibility"] = ""
         return clean_staff(df)
     except Exception as exc:
         st.session_state.supabase_error = str(exc)
         return empty
 
+
+# --- Private CV storage / employee-name matching ---
+CV_BUCKET = "employee-cvs"
+
+def cv_name_key(value):
+    """Match 'Juan Dela Cruz.pdf' with 'DELA CRUZ, Juan' (case-insensitive).
+    Assumes comma-formatted employee names use LAST, FIRST. Ambiguous matches are skipped.
+    """
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    value = re.sub(r"\.(?:pdf|docx|doc)$", "", value, flags=re.I).strip()
+    if "," in value:
+        last, first = value.split(",", 1)
+        value = first + " " + last
+    value = re.sub(r"[^a-zA-Z0-9]+", " ", value.casefold())
+    return " ".join(sorted(value.split()))
+
+def cv_clean_filename(filename):
+    """Extract a staff name from CV files with codes and role annotations."""
+    name = re.sub(r"\.(?:pdf|docx|doc)$", "", str(filename or ""), flags=re.I).strip()
+    # Examples: B173 - NAME, BR1 - NAME, B 424 - NAME
+    name = re.sub(r"^\s*[A-Za-z]{1,10}\s*[-_ ]?\s*\d+\s*[-–—_:]\s*", "", name)
+    # Role annotation e.g. NAME - (CC18 - Inspector), NAME (B057 - Engineer)
+    name = re.sub(r"\s*[-–—]?\s*\([^)]*\)\s*$", "", name)
+    # Remove any trailing role following an explicit dash after the name.
+    if "," in name:
+        name = re.split(r"\s+[-–—]\s+", name, maxsplit=1)[0]
+    return name.strip(" ._-–—")
+
+
+def cv_filename_key(filename):
+    return cv_name_key(cv_clean_filename(filename))
+
+
+def cv_tokens(value):
+    value = unicodedata.normalize("NFKD", str(value or ""))
+    value = "".join(c for c in value if not unicodedata.combining(c))
+    return re.findall(r"[a-z0-9]+", value.casefold())
+
+
+def cv_filename_identity(filename):
+    name = cv_clean_filename(filename)
+    if "," not in name:
+        return None
+    last, given = name.split(",", 1)
+    return cv_tokens(last), cv_tokens(given)
+
+
+def cv_match_candidates(filename, index):
+    """Conservative matching: exact or unique surname + full first name.
+
+    Missing middle initials are allowed; conflicting supplied middle names
+    are not. Ambiguous employees must be reviewed manually.
+    """
+    exact = index.get(cv_filename_key(filename), [])
+    if exact:
+        return exact
+
+    identity = cv_filename_identity(filename)
+    cleaned = cv_clean_filename(filename)
+    matches = []
+    seen = set()
+    for rows in index.values():
+        for row in rows:
+            raw_staff = str(row.get("name") or "")
+            if "," not in raw_staff:
+                continue
+            db_last_raw, db_given_raw = raw_staff.split(",", 1)
+            db_last, db_given = cv_tokens(db_last_raw), cv_tokens(db_given_raw)
+            if not db_last or not db_given:
+                continue
+            if identity:
+                last, given = identity
+                if last != db_last or not given or len(given[0]) < 2:
+                    continue
+                if given[0] != db_given[0]:
+                    continue
+                extras = given[1:]
+            else:
+                tokens = cv_tokens(cleaned)
+                if len(tokens) < 2 or tokens[0] != db_given[0]:
+                    continue
+                if tokens[-len(db_last):] != db_last:
+                    continue
+                extras = tokens[1:len(tokens) - len(db_last)]
+            # Additional names/initials in the CV must match the database.
+            # An omitted middle name is acceptable only for a unique candidate.
+            db_extra = db_given[1:]
+            if any(not any(t == d or (len(t) == 1 and d.startswith(t))
+                           for d in db_extra) for t in extras):
+                continue
+            rid = str(row.get("id"))
+            if rid not in seen:
+                seen.add(rid)
+                matches.append(row)
+    return matches
+
+
+def cv_staff_index(client):
+    rows = []
+    offset = 0
+    while True:
+        batch = (client.table("staff_records").select("id,name")
+                 .range(offset, offset + 999).execute()).data or []
+        rows.extend(batch)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    by_name = {}
+    for row in rows:
+        key = cv_name_key(row.get("name"))
+        if key:
+            by_name.setdefault(key, []).append(row)
+    return by_name
+
+def cv_upload_batch(files):
+    client = get_supabase_client()
+    index = cv_staff_index(client)
+    matched, unmatched, failed = [], [], []
+    for f in files:
+        extension = f.name.rsplit(".", 1)[-1].lower() if "." in f.name else ""
+        allowed_types = {
+            "pdf": "application/pdf",
+            "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "doc": "application/msword",
+        }
+        if extension not in allowed_types:
+            failed.append(f"{f.name}: only PDF, DOCX, and DOC files are supported")
+            continue
+        data = f.getvalue()
+        if extension == "pdf" and not data.startswith(b"%PDF-"):
+            failed.append(f"{f.name}: invalid PDF")
+            continue
+        if extension == "docx":
+            try:
+                with zipfile.ZipFile(io.BytesIO(data)) as document:
+                    if "word/document.xml" not in document.namelist():
+                        raise ValueError("missing Word document content")
+            except (zipfile.BadZipFile, ValueError):
+                failed.append(f"{f.name}: invalid DOCX")
+                continue
+        if extension == "doc" and not data.startswith(bytes.fromhex("D0CF11E0A1B11AE1")):
+            failed.append(f"{f.name}: invalid legacy Word document")
+            continue
+        candidates = cv_match_candidates(f.name, index)
+        if len(candidates) != 1:
+            unmatched.append(f"{f.name}: {'no match' if not candidates else 'ambiguous employee name'}")
+            continue
+        staff = candidates[0]
+        staff_id = str(staff["id"])
+        digest = hashlib.sha256(data).hexdigest()[:16]
+        path = f"{staff_id}/{digest}.{extension}"
+        try:
+            client.storage.from_(CV_BUCKET).upload(
+                path, data, {"content-type": allowed_types[extension], "upsert": "true"}
+            )
+            old = (client.table("staff_cvs").select("storage_path")
+                   .eq("staff_record_id", staff_id).execute()).data or []
+            client.table("staff_cvs").upsert({
+                "staff_record_id": staff["id"], "employee_name": staff["name"],
+                "original_filename": f.name, "storage_path": path,
+                "file_size": len(data), "uploaded_at": datetime.now(timezone.utc).isoformat(),
+            }, on_conflict="staff_record_id").execute()
+            matched.append(f"{f.name} → {staff['name']}")
+            # Do not delete previous object until metadata is committed.
+            for prev in old:
+                if prev.get("storage_path") and prev["storage_path"] != path:
+                    try:
+                        client.storage.from_(CV_BUCKET).remove([prev["storage_path"]])
+                    except Exception:
+                        pass
+        except Exception as exc:
+            failed.append(f"{f.name}: {exc}")
+    if matched:
+        cv_metadata_for_names.clear()
+        cv_signed_link.clear()
+        st.session_state.pop("cv_once_metadata", None)
+        st.session_state.pop("cv_once_urls", None)
+    return matched, unmatched, failed
+
+@st.cache_data(show_spinner=False)
+def cv_metadata_for_names(names):
+    """Return one CV per exact normalized employee name, without public URLs."""
+    client = get_supabase_client()
+    desired = {cv_name_key(n) for n in names}
+    results = {}
+    offset = 0
+    while True:
+        batch = (client.table("staff_cvs")
+                 .select("employee_name,original_filename,storage_path")
+                 .range(offset, offset + 999).execute()).data or []
+        for item in batch:
+            key = cv_name_key(item.get("employee_name"))
+            if key in desired:
+                results[key] = item
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    return results
+
+@st.cache_data(show_spinner=False, max_entries=2000)
+def cv_signed_link(path):
+    client = get_supabase_client()
+    response = client.storage.from_(CV_BUCKET).create_signed_url(path, 86400)
+    return response.get("signedURL") or response.get("signedUrl") or ""
+
+def cv_zip_export(pdf_bytes, staff_names, metadata):
+    client = get_supabase_client()
+    output = io.BytesIO()
+    included, missing = [], []
+    used = set()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("Filtered_Personnel_List.pdf", pdf_bytes)
+        for name in dict.fromkeys(staff_names):
+            entry = metadata.get(cv_name_key(name))
+            if not entry:
+                missing.append(name)
+                continue
+            try:
+                blob = client.storage.from_(CV_BUCKET).download(entry["storage_path"])
+                safe = re.sub(r"[^\w .()-]", "_", str(name)).strip()[:100] or "Employee"
+                extension = str(entry.get("original_filename") or entry.get("storage_path") or "").rsplit(".", 1)[-1].lower()
+                if extension not in {"pdf", "docx", "doc"}:
+                    extension = "pdf"
+                filename = f"Employee_CVs/{safe}.{extension}"
+                if filename in used:
+                    continue
+                used.add(filename)
+                z.writestr(filename, blob)
+                included.append(name)
+            except Exception:
+                missing.append(name)
+        z.writestr("CV_Export_Summary.txt", "Included CVs: " + str(len(included)) +
+                   "\nMissing or unavailable CVs: " + str(len(missing)) +
+                   "\n\n" + "\n".join(missing))
+    return output.getvalue(), included, missing
 
 def _dedupe_key(name, position, project):
     """Build a case-insensitive key used to identify the same staff/project record."""
@@ -842,7 +1140,7 @@ def upload_staff_to_supabase(uploaded, parsed_df):
     while True:
         result = (
             client.table("staff_records")
-            .select("id,name,position,type_of_engagement,evaluation,status,project,funding,sector,experience,source_file,source_path")
+            .select("id,name,position,type_of_engagement,evaluation,status,project,funding,sector,experience,end_of_contract,eligibility,source_file,source_path")
             .range(start, start + page_size - 1)
             .execute()
         )
@@ -859,8 +1157,11 @@ def upload_staff_to_supabase(uploaded, parsed_df):
             break
         start += page_size
 
+    if "Eligibility" not in parsed_df.columns:
+        parsed_df["Eligibility"] = ""
+
     source = parsed_df[[
-        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience"
+        "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Overseas Experience", "End of Contract", "Eligibility"
     ]].copy()
     source = source.fillna("").astype(str)
 
@@ -909,6 +1210,8 @@ def upload_staff_to_supabase(uploaded, parsed_df):
                 "sector": str(row["Sector"]).strip(),
                 "experience": str(row["Experience"]).strip(),
                 "overseas_experience": (float(row["Overseas Experience"]) if str(row["Overseas Experience"]).strip() not in ("", "nan", "None") else None),
+                "end_of_contract": parse_contract_date(row["End of Contract"]),
+                "eligibility": str(row["Eligibility"]).strip(),
                 "source_file": filename,
                 "source_path": storage_path,
                 "uploaded_at": uploaded_at,
@@ -923,7 +1226,7 @@ def upload_staff_to_supabase(uploaded, parsed_df):
             changes["evaluation"] = evaluation
         if norm(existing.get("status")) != norm(status):
             changes["status"] = status
-        for db_col, source_col in [("funding", "Funding"), ("sector", "Sector"), ("experience", "Experience")]:
+        for db_col, source_col in [("funding", "Funding"), ("sector", "Sector"), ("experience", "Experience"), ("eligibility", "Eligibility")]:
             new_value = str(row[source_col]).strip()
             if new_value and norm(existing.get(db_col)) != norm(new_value):
                 changes[db_col] = new_value
@@ -939,6 +1242,10 @@ def upload_staff_to_supabase(uploaded, parsed_df):
                     changes["overseas_experience"] = parsed_overseas
             except (TypeError, ValueError):
                 pass
+
+        contract_date = parse_contract_date(row["End of Contract"])
+        if contract_date and str(existing.get("end_of_contract") or "")[:10] != contract_date:
+            changes["end_of_contract"] = contract_date
 
         if changes:
             # Record where the latest values came from.
@@ -996,7 +1303,7 @@ def fetch_staff_for_editor():
     while True:
         result = (
             client.table("staff_records")
-            .select("id,name,position,type_of_engagement,evaluation,status,project,funding,sector,experience")
+            .select("id,name,position,type_of_engagement,evaluation,status,project,funding,sector,experience,eligibility")
             .order("id")
             .range(start, start + page_size - 1)
             .execute()
@@ -1020,6 +1327,7 @@ def fetch_staff_for_editor():
         "funding": "Funding",
         "sector": "Sector",
         "experience": "Experience",
+        "eligibility": "Eligibility",
     })
 
 
@@ -1029,7 +1337,7 @@ def save_staff_editor_changes(original_df, edited_df):
     if client is None:
         raise RuntimeError("Supabase is not configured.")
 
-    fields = ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience"]
+    fields = ["Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project", "Funding", "Sector", "Experience", "Eligibility"]
     db_fields = {
         "Name": "name",
         "Position": "position",
@@ -1040,6 +1348,7 @@ def save_staff_editor_changes(original_df, edited_df):
         "Funding": "funding",
         "Sector": "sector",
         "Experience": "experience",
+        "Eligibility": "eligibility",
     }
 
     def clean(v):
@@ -1222,6 +1531,7 @@ def staff_editor_dialog():
             "Funding": st.column_config.TextColumn("Funding"),
             "Sector": st.column_config.TextColumn("Sector"),
             "Experience": st.column_config.TextColumn("Total Year Experience"),
+            "Eligibility": st.column_config.TextColumn("Eligibility"),
         },
         height=520,
     )
@@ -1249,8 +1559,20 @@ def staff_editor_dialog():
             st.error(f"Unable to save changes: {exc}")
 
 
-def make_pdf(df, funding, position, evaluations, current_project):
-    """Export only visible staff fields and applied filters."""
+def project_grouped_rows(df):
+    """Sort projects alphabetically, then sort employees by name within each project."""
+    result = df.copy()
+    result["Current Project"] = result["Current Project"].fillna("—").astype(str).str.strip()
+    result.loc[result["Current Project"].isin(["", "nan", "None"]), "Current Project"] = "—"
+    result["_project_sort"] = result["Current Project"].map(str.casefold)
+    result["_name_sort"] = result["Name"].fillna("").astype(str).map(str.casefold)
+    result = result.sort_values(["_project_sort", "_name_sort"], kind="stable")
+    return [(project, group.drop(columns=["_project_sort", "_name_sort"]))
+            for project, group in result.groupby("Current Project", sort=False)]
+
+
+def make_pdf(df, funding, position, evaluations, current_project, group_by_project=True):
+    """Export filtered staff in a single PDF, separated and sorted by current project."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
                             rightMargin=28, leftMargin=28, topMargin=28, bottomMargin=28)
@@ -1258,28 +1580,37 @@ def make_pdf(df, funding, position, evaluations, current_project):
     styles["Title"].alignment = TA_CENTER
     story = [
         Paragraph("Oriental Consultants Philippines Inc.", styles["Title"]),
-        Paragraph("Filtered Personnel List", styles["Heading2"]), Spacer(1, 8),
-        Paragraph(f"<b>Current Project:</b> {escape(current_project)}", styles["BodyText"]),
+        Paragraph("Personnel List by Current Project" if group_by_project else "Personnel List", styles["Heading2"]), Spacer(1, 8),
+        Paragraph(f"<b>Selected Project(s):</b> {escape(str(current_project))}", styles["BodyText"]),
         Spacer(1, 5),
-        Paragraph(f"<b>Funding:</b> {escape(funding)} &nbsp; | &nbsp; <b>Position:</b> {escape(position)} &nbsp; | &nbsp; "
+        Paragraph(f"<b>Funding:</b> {escape(str(funding))} &nbsp; | &nbsp; <b>Position:</b> {escape(str(position))} &nbsp; | &nbsp; "
                   f"<b>Evaluation:</b> {escape(', '.join(evaluations) or 'All')} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
-                  styles["BodyText"]), Spacer(1, 14)
+                  styles["BodyText"]), Spacer(1, 12)
     ]
-    cols = ["Name", "Position", "Sector", "Funding", "Total Year Experience", "Overseas Experience", "Evaluation"]
-    data = [[Paragraph(f"<b>{c}</b>", styles["BodyText"]) for c in cols]]
-    for _, r in df[cols].fillna("").iterrows():
-        data.append([Paragraph(str(r[c]), styles["BodyText"]) for c in cols])
-    t = Table(data, repeatRows=1, colWidths=[126, 155, 92, 72, 92, 92, 106])
-    t.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9EEF5")),
-        ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#D5DAE3")),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 7),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
-        ("TOPPADDING", (0, 0), (-1, -1), 6),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
-    ]))
-    story.append(t)
+    cols = ["Name", "Position", "Current Project", "Eligibility", "Sector", "Funding", "Total Year Experience", "Overseas Experience", "Evaluation", "End of Contract"]
+    widths = [86, 94, 64, 75, 57, 44, 59, 59, 76, 69]
+    if group_by_project:
+        pdf_groups = project_grouped_rows(df)
+    else:
+        pdf_groups = [(None, df.sort_values("Name", kind="stable"))]
+    for project, group in pdf_groups:
+        if project is not None:
+            story.append(Paragraph(f"{escape(project)} — {len(group):,} employee(s)", styles["Heading3"]))
+            story.append(Spacer(1, 5))
+        data = [[Paragraph(f"<b>{escape(c)}</b>", styles["BodyText"]) for c in cols]]
+        for _, record in group.iterrows():
+            data.append([Paragraph(escape(str(record.get(c, "") if pd.notna(record.get(c, "")) else "")), styles["BodyText"]) for c in cols])
+        table = Table(data, repeatRows=1, colWidths=widths, hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9EEF5")),
+            ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#D5DAE3")),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 5),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ]))
+        story.extend([table, Spacer(1, 14)])
     doc.build(story)
     return buffer.getvalue()
 
@@ -1349,7 +1680,10 @@ if not st.session_state.logged_in:
 # CURRENT STAFF DATABASE - LOADED FROM SUPABASE
 # ============================================================
 
-active_df = fetch_staff_from_supabase()
+if "personnel_once_df" not in st.session_state:
+    with st.spinner("Loading personnel records for this session..."):
+        st.session_state["personnel_once_df"] = fetch_staff_from_supabase()
+active_df = st.session_state["personnel_once_df"].copy()
 
 
 # Classic OCP header layout
@@ -1375,18 +1709,54 @@ with _admin_col:
         st.markdown("**Staff Database**")
         admin_category = st.radio(
             "Admin Category",
-            ["Upload Staff Database", "Add & Edit Staff Data"],
+            ["Upload Staff Database", "Add & Edit Staff Data", "Upload & Manage CVs"],
             horizontal=True,
             label_visibility="collapsed",
             key="admin_category"
         )
 
+        if admin_category == "Upload & Manage CVs":
+            st.caption("Upload multiple PDF or Word CVs (.pdf, .docx, .doc). Names are matched to staff records; ambiguous matches are skipped.")
+            cv_files = st.file_uploader("Upload employee CVs", type=["pdf", "docx", "doc"],
+                                        accept_multiple_files=True, key="cv_upload")
+            if cv_files and st.button("Save CVs to Supabase", use_container_width=True, type="primary"):
+                with st.spinner("Matching and uploading CVs..."):
+                    try:
+                        matched, unmatched, failed = cv_upload_batch(cv_files)
+                        st.success(f"{len(matched)} matched CV(s) uploaded.")
+                        st.info(f"Processed {len(matched) + len(unmatched) + len(failed)} file(s): "
+                                f"{len(matched)} uploaded, {len(unmatched)} unmatched/ambiguous, "
+                                f"{len(failed)} upload error(s).")
+                        if unmatched:
+                            st.warning(f"{len(unmatched)} CV(s) need review. Showing the first 15 below.")
+                            st.text("\n".join(unmatched[:15]))
+                        if failed:
+                            st.error(f"{len(failed)} upload error(s). Showing the first 15 below.")
+                            st.text("\n".join(failed[:15]))
+                        if unmatched or failed:
+                            import csv
+                            report = io.StringIO()
+                            writer = csv.writer(report)
+                            writer.writerow(["Status", "Filename / details"])
+                            writer.writerows(("Unmatched or ambiguous", v) for v in unmatched)
+                            writer.writerows(("Upload failed", v) for v in failed)
+                            st.session_state["cv_import_issues_csv"] = report.getvalue().encode("utf-8-sig")
+                        else:
+                            st.session_state.pop("cv_import_issues_csv", None)
+                    except Exception as exc:
+                        st.error(f"CV upload failed: {exc}. Check SQL setup and private Storage bucket.")
+            if st.session_state.get("cv_import_issues_csv"):
+                st.download_button("Download all unmatched / failed CVs (CSV)",
+                    st.session_state["cv_import_issues_csv"],
+                    file_name="OCP_CV_Import_Issues.csv", mime="text/csv",
+                    use_container_width=True)
+            st.divider()
         if admin_category == "Add & Edit Staff Data":
             st.caption("Add new staff or edit existing staff information directly in Supabase for evaluation.")
             if st.button("Open Add & Edit Staff Data", type="primary", use_container_width=True):
                 staff_editor_dialog()
             st.divider()
-        else:
+        elif admin_category == "Upload Staff Database":
             st.caption("Upload an Excel or CSV file to Supabase. Existing staff are skipped and only new records are added.")
 
         uploaded = None
@@ -1426,7 +1796,7 @@ with _admin_col:
                                     st.caption(
                                         f"{result['skipped_upload_duplicates']:,} duplicate row(s) inside the uploaded file were also skipped."
                                     )
-                                time.sleep(1.2)
+                                st.session_state.pop("personnel_once_df", None)
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Supabase upload failed: {e}")
@@ -1448,7 +1818,7 @@ if active_df.empty:
 
 
 filtered = active_df.copy()
-for col in ["Name", "Position", "Sector", "Experience", "Overseas Experience", "Funding", "Project", "Evaluation", "Status"]:
+for col in ["Name", "Position", "Sector", "Experience", "Overseas Experience", "Funding", "Project", "Evaluation", "Status", "End of Contract", "Eligibility"]:
     if col not in filtered.columns:
         filtered[col] = ""
     filtered[col] = filtered[col].fillna("").astype(str).str.strip()
@@ -1592,7 +1962,37 @@ def sector_matches(value, selected):
     return [p.casefold() for p in parts[:len(selected_parts)]] == [p.casefold() for p in selected_parts]
 
 
-c1, c2, c3 = st.columns(3)
+# Target Position is computed from the existing Position field; no database migration.
+# Keep the matching rules explicit so they can be refined for OCP job titles.
+import re as _target_re
+
+TARGET_POSITION_CATEGORIES = [
+    "Structure",
+    "Quality Assurance / Quality Control",
+    "QS (Quantity Surveyor)",
+    "BIM",
+    "Accounting",
+]
+
+def target_position_matches(position_text, target):
+    if not target or target == "All Target Positions":
+        return True
+    name = _target_re.sub(r"[^a-z0-9]+", " ", str(position_text or "").casefold()).strip()
+    def contains(pattern):
+        return bool(_target_re.search(pattern, name))
+    if target == "Structure":
+        return contains(r"\b(structur(?:e|al|es)|bridge|viaduct|seismic|foundation|geotechnical|geotech|steel design|concrete design)\b")
+    if target == "Quality Assurance / Quality Control":
+        return contains(r"\b(qa|qc|qa qc|quality assurance|quality control|quality engineer|quality inspector|material(?:s)? engineer|material(?:s)? inspector|inspection engineer)\b")
+    if target == "QS (Quantity Surveyor)":
+        return contains(r"\b(qs|quantity survey(?:or|ing)|cost engineer|cost estimator|estimat(?:or|ing)|bill of quantities|boq|commercial engineer)\b")
+    if target == "BIM":
+        return contains(r"\b(bim|building information model(?:ing|ling)?|revit|bim modeler|bim modeller|bim coordinator|bim manager)\b")
+    if target == "Accounting":
+        return contains(r"\b(account(?:ant|ants|ing|s)?|bookkeep(?:er|ing)|finance|financial|payroll|auditor|audit|taxation|tax|treasury|billing|accounts payable|accounts receivable)\b")
+    return False
+
+c1, c2, c3, c_target = st.columns([1.0, 1.05, 1.05, 1.3], gap="small")
 with c1:
     funding_options = sorted(x for x in filtered["Funding Display"].unique() if x)
     funding = st.selectbox("Funding", ["All Funding"] + funding_options)
@@ -1659,6 +2059,16 @@ with c3:
     position = st.selectbox("Position", ["All Positions"] + list(position_options),
                             help="Similar positions are grouped across spelling, capitalization, &/and, punctuation, and numbered levels. Original employee positions are preserved.")
 
+with c_target:
+    target_positions = st.multiselect(
+        "Target Position",
+        TARGET_POSITION_CATEGORIES,
+        default=[],
+        placeholder="All Target Positions",
+        help="Select one or more target categories. Matching any selected category includes the employee. Leave empty to show all positions.",
+        key="target_position_filter",
+    )
+
 c4, c5, c6 = st.columns(3)
 with c4:
     st.markdown("<div class='experience-filter-heading'>Years of Experience</div>", unsafe_allow_html=True)
@@ -1698,11 +2108,15 @@ with c6:
         (x for x in filtered["Project"].unique() if x and x != "—"),
         key=str.casefold,
     )
-    current_project = st.selectbox(
+    selected_projects = st.multiselect(
         "Current Project",
-        ["All Projects"] + project_options,
-        help="Filter staff by their current project recorded in Supabase.",
+        options=project_options,
+        default=[],
+        placeholder="All Projects",
+        help="Select one or more projects. Leave empty to show all projects.",
+        key="current_project_multiselect",
     )
+    current_project = ", ".join(selected_projects) if selected_projects else "All Projects"
 
 # Default to active staff only. The toggle includes inactive/other-status
 # records without changing any stored Supabase status values.
@@ -1723,6 +2137,12 @@ if sector:
     filtered = filtered[filtered["Sector"].map(lambda value: sector_matches(value, sector))]
 if position != "All Positions":
     filtered = filtered[filtered["Position Group"].eq(position_options[position])]
+if target_positions:
+    filtered = filtered[
+        filtered["Position"].map(
+            lambda value: any(target_position_matches(value, target) for target in target_positions)
+        )
+    ]
 if experience_min > 0:
     years = filtered["Experience"].map(experience_years)
     filtered = filtered[years.ge(experience_min)]
@@ -1731,41 +2151,214 @@ if filter_overseas and overseas_min > 0:
     filtered = filtered[overseas_years.ge(overseas_min)]
 if evaluations:
     filtered = filtered[filtered["Evaluation Display"].isin(evaluations)]
-if current_project != "All Projects":
-    filtered = filtered[filtered["Project"].eq(current_project)]
+if selected_projects:
+    filtered = filtered[filtered["Project"].isin(selected_projects)]
 
-display_df = filtered[["Name", "Position", "Sector", "Funding Display", "Experience", "Overseas Experience", "Evaluation Display"]].copy()
+display_df = filtered[["Name", "Position", "Project", "Eligibility", "Sector", "Funding Display", "Experience", "Overseas Experience", "Evaluation Display", "End of Contract"]].copy()
 display_df = display_df.rename(columns={
-    "Funding Display": "Funding", "Experience": "Total Year Experience", "Evaluation Display": "Evaluation"
+    "Project": "Current Project", "Funding Display": "Funding", "Experience": "Total Year Experience", "Evaluation Display": "Evaluation"
 })
 for col in display_df.columns:
     display_df[col] = display_df[col].replace({"": "—", "nan": "—", "None": "—"})
+# Format dates for display/export only; Supabase continues storing ISO DATE values.
+def format_contract_date(value):
+    if value is None or str(value).strip().lower() in ("", "—", "nan", "none", "nat"):
+        return "—"
+    parsed = pd.to_datetime(value, errors="coerce")
+    if pd.isna(parsed):
+        return "—"
+    return f"{parsed.strftime('%B')} {parsed.day}, {parsed.year}"
+
+
+display_df["End of Contract"] = display_df["End of Contract"].map(format_contract_date)
 display_df = display_df.sort_values("Name", kind="stable")
 
 r1, r2 = st.columns([4, 1.25])
 with r1:
     st.markdown(f'<div class="section-title" style="margin-top:8px">{len(filtered):,} {"Staff Found" if show_inactive_staff else "Active Staff Found"}</div>', unsafe_allow_html=True)
-    st.caption(f"Current Project: {current_project}")
+    st.markdown(
+        f'<div style="display:flex;align-items:center;gap:7px;margin-top:2px;color:#8a8e98;font-size:0.83rem;">'
+        f'<span>Current Project: {escape(str(current_project))}</span>'
+        '<span title="Click a blue employee name to open the matching CV. Names without uploaded CVs remain plain text." '
+        'aria-label="CV viewing help" style="display:inline-flex;align-items:center;justify-content:center;'
+        'width:15px;height:15px;border:1px solid #8a8e98;border-radius:50%;font-size:11px;'
+        'font-weight:600;cursor:help;">?</span></div>',
+        unsafe_allow_html=True,
+    )
 with r2:
     if not filtered.empty:
         pdf = make_pdf(display_df, funding, position, evaluations, current_project)
-        st.download_button("Download Filtered PDF", pdf, "OCP_Filtered_Staff_List.pdf",
-                           "application/pdf", use_container_width=True)
+        if st.button("Download Filtered PDF", use_container_width=True, key="export_filtered_staff"):
+            st.session_state["open_cv_export"] = True
 
-# Balanced column widths keep all seven fields visible in the main table.
-# Widths are in pixels; the table still stretches to the available page width.
-st.dataframe(
-    display_df,
-    use_container_width=True,
-    hide_index=True,
-    height=580,
-    column_config={
-        "Name": st.column_config.TextColumn("Name", width=300),
-        "Position": st.column_config.TextColumn("Position", width=315),
-        "Sector": st.column_config.TextColumn("Sector", width=170),
-        "Funding": st.column_config.TextColumn("Funding", width=100),
-        "Total Year Experience": st.column_config.TextColumn("Total Year Experience", width=160),
-        "Overseas Experience": st.column_config.TextColumn("Overseas Experience", width=160),
-        "Evaluation": st.column_config.TextColumn("Evaluation", width=285),
-    },
+@st.dialog("Export Filtered Personnel", width="large")
+def cv_export_dialog():
+    # The project selector applies only to printing/exporting, not the main table filters.
+    all_rows = display_df.reset_index(drop=True).copy()
+    all_groups = project_grouped_rows(all_rows)
+    project_names = [project for project, _ in all_groups]
+    selected_export_projects = st.multiselect(
+        "Select projects to print / download",
+        options=project_names,
+        default=[],
+        placeholder="All Projects (no project grouping)",
+        key="cv_export_project_choices",
+        help="Select two or more projects. Leave empty to include all filtered employees in one alphabetical table without project sections.",
+    )
+    all_projects_mode = not selected_export_projects
+    if all_projects_mode:
+        export_rows = all_rows.copy()
+        st.caption("All Projects · no project grouping · employees sorted alphabetically")
+    else:
+        export_rows = all_rows[all_rows["Current Project"].isin(selected_export_projects)].copy()
+        st.caption(f"{len(selected_export_projects)} project(s) selected")
+    export_rows = export_rows.sort_values("Name", kind="stable").reset_index(drop=True)
+    st.write(f"**{len(export_rows):,} employee(s) selected**")
+
+    if all_projects_mode:
+        # All Projects is a single ungrouped alphabetical table.
+        st.dataframe(
+            export_rows,
+            use_container_width=True,
+            hide_index=True,
+            height=min(560, max(110, 35 * (len(export_rows) + 1))),
+        )
+    else:
+        # Multiple selected projects are previewed in separate project sections.
+        for project_name, project_staff in project_grouped_rows(export_rows):
+            st.markdown(f"**{project_name} — {len(project_staff):,} employee(s)**")
+            st.dataframe(
+                project_staff.reset_index(drop=True),
+                use_container_width=True,
+                hide_index=True,
+                height=min(560, max(110, 35 * (len(project_staff) + 1))),
+            )
+
+    # CV metadata is only needed if the user opts into a ZIP; it is never shown as a column.
+    metadata = {}
+    cv_lookup_error = None
+    try:
+        metadata = cv_metadata_for_names(export_rows["Name"].tolist())
+    except Exception as exc:
+        cv_lookup_error = str(exc)
+    available_count = sum(cv_name_key(name) in metadata for name in export_rows["Name"])
+    if cv_lookup_error:
+        st.warning("CV availability could not be checked. The personnel PDF can still be downloaded.")
+    include_cvs = st.checkbox(
+        "Include matching employee CVs (ZIP)",
+        value=False,
+        disabled=bool(cv_lookup_error) or available_count == 0,
+        key="export_include_matching_cvs",
+    )
+
+    export_label = "All Projects" if all_projects_mode else ", ".join(selected_export_projects)
+    pdf_bytes = make_pdf(
+        export_rows, funding, position, evaluations,
+        export_label, group_by_project=not all_projects_mode,
+    )
+    safe_project = "All_Projects" if all_projects_mode else "_".join(
+        re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") for name in selected_export_projects
+    )[:110]
+    if not include_cvs:
+        st.download_button(
+            "Download Personnel PDF", pdf_bytes, f"OCP_Personnel_{safe_project}.pdf",
+            mime="application/pdf", use_container_width=True,
+        )
+    else:
+        # Changing project selection invalidates any ZIP prepared for another project.
+        zip_key = f"{export_label}|{'|'.join(export_rows['Name'].astype(str))}"
+        if st.button("Prepare ZIP with CVs", use_container_width=True):
+            with st.spinner("Preparing private CV files..."):
+                try:
+                    archive, included, missing = cv_zip_export(
+                        pdf_bytes, export_rows["Name"].tolist(), metadata
+                    )
+                    st.session_state["cv_export_zip"] = archive
+                    st.session_state["cv_export_zip_key"] = zip_key
+                    st.session_state["cv_export_counts"] = (len(included), len(missing))
+                except Exception as exc:
+                    st.error(f"Unable to prepare CV export: {exc}")
+        if (st.session_state.get("cv_export_zip") and
+                st.session_state.get("cv_export_zip_key") == zip_key):
+            n, m = st.session_state.get("cv_export_counts", (0, 0))
+            st.caption(f"{n} CV(s) included; {m} missing/unavailable.")
+            st.download_button(
+                "Download PDF + CVs ZIP", st.session_state["cv_export_zip"],
+                f"OCP_Personnel_{safe_project}_CVs.zip", mime="application/zip",
+                use_container_width=True,
+            )
+
+if st.session_state.pop("open_cv_export", False):
+    st.session_state.pop("cv_export_zip", None)
+    cv_export_dialog()
+
+# Display the employee name as the CV link, without a separate CV column.
+# Render an HTML table so linked and unlinked names can share the same column.
+from html import escape as html_escape
+
+table_df = display_df.copy()
+# Fetch CV metadata and signed links only once per Streamlit user session.
+# Filters reuse this snapshot; uploading CVs invalidates it explicitly.
+if "cv_once_metadata" not in st.session_state:
+    with st.spinner("Loading CV links for this session..."):
+        try:
+            all_names = tuple(sorted(set(active_df["Name"].dropna().astype(str))))
+            st.session_state["cv_once_metadata"] = cv_metadata_for_names(all_names)
+        except Exception:
+            st.session_state["cv_once_metadata"] = {}
+if "cv_once_urls" not in st.session_state:
+    with st.spinner("Preparing CV links once..."):
+        links = {}
+        for key, item in st.session_state["cv_once_metadata"].items():
+            try:
+                links[key] = cv_signed_link(item["storage_path"])
+            except Exception:
+                continue
+        st.session_state["cv_once_urls"] = links
+cv_urls = st.session_state["cv_once_urls"]
+
+# Compact widths preserve all personnel columns on a standard desktop screen.
+column_widths = {
+    "Name": "16%", "Position": "16%", "Current Project": "8%",
+    "Eligibility": "10%", "Sector": "8%", "Funding": "6%", "Total Year Experience": "9%",
+    "Overseas Experience": "9%", "Evaluation": "10%", "End of Contract": "8%",
+}
+visible_cols = list(table_df.columns)
+headers = "".join(
+    f'<th style="width:{column_widths.get(c, "auto")}">{html_escape(str(c))}</th>'
+    for c in visible_cols
 )
+rows_html = []
+for _, record in table_df.iterrows():
+    cells = []
+    for col in visible_cols:
+        value = record[col]
+        label = "—" if pd.isna(value) or str(value).strip() == "" else str(value)
+        content = html_escape(label)
+        if col == "Name":
+            url = cv_urls.get(cv_name_key(label), "")
+            if url and url.startswith(("https://", "http://")):
+                content = (
+                    f'<a href="{html_escape(url, quote=True)}" target="_blank" '
+                    f'rel="noopener noreferrer" title="Open CV for {html_escape(label, quote=True)}">'
+                    f'{content} <span aria-hidden="true">↗</span></a>'
+                )
+        cells.append(f"<td>{content}</td>")
+    rows_html.append("<tr>" + "".join(cells) + "</tr>")
+
+st.markdown(
+    """<style>
+    .ocp-staff-scroll {max-height:565px;overflow-y:auto;overflow-x:auto;border:1px solid #dfe6ee;border-radius:12px;background:white;}
+    .ocp-staff-table {width:100%;table-layout:fixed;border-collapse:collapse;font-family:Inter,Arial,sans-serif;font-size:12px;color:#26344c;}
+    .ocp-staff-table th {position:sticky;top:0;background:#f7f9fc;z-index:1;color:#728198;font-weight:500;text-align:left;}
+    .ocp-staff-table td,.ocp-staff-table th {padding:10px 7px;border-bottom:1px solid #e4e9ef;vertical-align:middle;overflow-wrap:anywhere;}
+    .ocp-staff-table a {color:#1163bd;text-decoration:none;font-weight:500;}
+    .ocp-staff-table a:hover {text-decoration:underline;}
+    .ocp-staff-table tr:hover td {background:#f7faff;}
+    </style>"""
+    + '<div class="ocp-staff-scroll"><table class="ocp-staff-table"><thead><tr>'
+    + headers + '</tr></thead><tbody>' + "".join(rows_html)
+    + '</tbody></table></div>',
+    unsafe_allow_html=True,
+)
+
