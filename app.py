@@ -10,6 +10,9 @@ import tomllib
 import unicodedata
 import hashlib
 import zipfile
+import threading
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote
 from datetime import datetime, timezone
 from supabase import create_client, Client
@@ -547,9 +550,9 @@ def normalize_columns(df):
         "EMPLOYEE NAME": "Name",
         "FULL NAME": "Name",
         "PERSONNEL NAME": "Name",
-        "POSITION": "Current Position",
+        "POSITION": "Position",
         "DESIGNATION": "Position",
-        "JOB TITLE": "Current Position",
+        "JOB TITLE": "Position",
         "TYPE OF ENGAGEMENT": "Type of Engagement",
         "ENGAGEMENT": "Type of Engagement",
         "EMPLOYMENT TYPE": "Type of Engagement",
@@ -1084,6 +1087,113 @@ def cv_zip_export(pdf_bytes, staff_names, metadata):
                    "\n\n" + "\n".join(missing))
     return output.getvalue(), included, missing
 
+@st.cache_resource(show_spinner=False)
+def _cv_job_registry():
+    # Shared between Streamlit reruns; each session only receives its own random job ID.
+    return {"lock": threading.Lock(), "jobs": {}}
+
+
+def _run_cv_export_job(job_id, url, key, pdf_bytes, names, metadata):
+    registry = _cv_job_registry()
+    unique_names = list(dict.fromkeys(names))
+    included, missing, downloaded = [], [], []
+    try:
+        tasks = [(name, metadata.get(cv_name_key(name))) for name in unique_names]
+        available = [(name, entry) for name, entry in tasks if entry]
+        missing.extend(name for name, entry in tasks if not entry)
+        with registry["lock"]:
+            registry["jobs"][job_id]["total"] = len(available)
+            registry["jobs"][job_id]["missing"] = len(missing)
+
+        def fetch(item):
+            name, entry = item
+            # Client is created inside the worker thread, not shared with Streamlit UI.
+            client = create_client(url, key)
+            blob = client.storage.from_(CV_BUCKET).download(entry["storage_path"])
+            return name, entry, blob
+
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            futures = {pool.submit(fetch, item): item[0] for item in available}
+            for future in as_completed(futures):
+                try:
+                    downloaded.append(future.result())
+                    included.append(futures[future])
+                except Exception:
+                    missing.append(futures[future])
+                with registry["lock"]:
+                    job = registry["jobs"].get(job_id)
+                    if job is None:
+                        return
+                    job["completed"] += 1
+                    job["included"] = len(included)
+                    job["missing"] = len(missing)
+
+        output = io.BytesIO()
+        used = set()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as archive:
+            archive.writestr("Filtered_Personnel_List.pdf", pdf_bytes)
+            for name, entry, blob in downloaded:
+                safe = re.sub(r"[^\w .()-]", "_", str(name)).strip()[:100] or "Employee"
+                extension = str(entry.get("original_filename") or entry.get("storage_path") or "").rsplit(".", 1)[-1].lower()
+                if extension not in {"pdf", "docx", "doc"}:
+                    extension = "pdf"
+                filename = f"Employee_CVs/{safe}.{extension}"
+                if filename in used:
+                    continue
+                used.add(filename)
+                archive.writestr(filename, blob)
+            archive.writestr("CV_Export_Summary.txt", f"Included CVs: {len(included)}\nMissing or unavailable CVs: {len(missing)}\n\n" + "\n".join(missing))
+        with registry["lock"]:
+            job = registry["jobs"].get(job_id)
+            if job is not None:
+                job.update(status="ready", data=output.getvalue(), completed=len(available))
+    except Exception as exc:
+        with registry["lock"]:
+            job = registry["jobs"].get(job_id)
+            if job is not None:
+                job.update(status="error", error=str(exc))
+
+
+def _dismiss_cv_job():
+    job_id = st.session_state.pop("cv_background_job_id", None)
+    if job_id:
+        registry = _cv_job_registry()
+        with registry["lock"]:
+            registry["jobs"].pop(job_id, None)
+
+
+@st.fragment(run_every="1s")
+def show_cv_export_status():
+    job_id = st.session_state.get("cv_background_job_id")
+    if not job_id:
+        return
+    registry = _cv_job_registry()
+    with registry["lock"]:
+        job = dict(registry["jobs"].get(job_id, {}))
+    if not job:
+        return
+    st.markdown("**CV Extraction Status**")
+    status = job.get("status")
+    if status == "running":
+        total = job.get("total", 0)
+        completed = job.get("completed", 0)
+        percent = completed / total if total else 0
+        st.progress(percent, text=f"CV Extraction in Progress — {completed}/{total} CVs ({percent:.0%})")
+    elif status == "ready":
+        st.success(f"CV Export Ready — {job.get('included', 0)} CV(s) included, {job.get('missing', 0)} missing.")
+        st.download_button(
+            "Download Completed CV ZIP", data=job["data"],
+            file_name=job["filename"], mime="application/zip",
+            on_click=_dismiss_cv_job, use_container_width=True,
+            key=f"download_background_{job_id}",
+        )
+    elif status == "error":
+        st.error("CV extraction failed: " + job.get("error", "Unknown error"))
+        if st.button("Dismiss CV Export Status", key=f"dismiss_{job_id}"):
+            _dismiss_cv_job()
+            st.rerun()
+
+
 def _dedupe_key(name, position, project):
     """Build a case-insensitive key used to identify the same staff/project record."""
     def norm(value):
@@ -1457,7 +1567,7 @@ def staff_editor_dialog():
 
     with f4:
         selected_position = st.selectbox(
-            "Position",
+            "Current Position",
             ["All Positions"] + position_values,
             key="edit_filter_position",
         )
@@ -1523,7 +1633,7 @@ def staff_editor_dialog():
         column_config={
             "id": st.column_config.NumberColumn("ID", help="Supabase record ID", width="small"),
             "Name": st.column_config.TextColumn("Name", required=True),
-            "Position": st.column_config.TextColumn("Position"),
+            "Position": st.column_config.TextColumn("Current Position"),
             "Type of Engagement": st.column_config.TextColumn("Type of Engagement"),
             "Evaluation": st.column_config.TextColumn("Evaluation"),
             "Status": st.column_config.TextColumn("Status"),
@@ -1583,11 +1693,11 @@ def make_pdf(df, funding, position, evaluations, current_project, group_by_proje
         Paragraph("Personnel List by Current Project" if group_by_project else "Personnel List", styles["Heading2"]), Spacer(1, 8),
         Paragraph(f"<b>Selected Project(s):</b> {escape(str(current_project))}", styles["BodyText"]),
         Spacer(1, 5),
-        Paragraph(f"<b>Funding:</b> {escape(str(funding))} &nbsp; | &nbsp; <b>Position:</b> {escape(str(position))} &nbsp; | &nbsp; "
+        Paragraph(f"<b>Funding:</b> {escape(str(funding))} &nbsp; | &nbsp; <b>Current Position:</b> {escape(str(position))} &nbsp; | &nbsp; "
                   f"<b>Evaluation:</b> {escape(', '.join(evaluations) or 'All')} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
                   styles["BodyText"]), Spacer(1, 12)
     ]
-    cols = ["Name", "Position", "Current Project", "Eligibility", "Sector", "Funding", "Total Year Experience", "Overseas Experience", "Evaluation", "End of Contract"]
+    cols = ["Name", "Current Position", "Current Project", "Eligibility", "Sector", "Funding", "Total Year Experience", "Overseas Experience", "Evaluation", "End of Contract"]
     widths = [86, 94, 64, 75, 57, 44, 59, 59, 76, 69]
     if group_by_project:
         pdf_groups = project_grouped_rows(df)
@@ -2056,7 +2166,7 @@ with c2:
 with c3:
     position_keys = sorted((x for x in filtered["Position Group"].unique() if x), key=str.casefold)
     position_options = {position_label(key): key for key in position_keys}
-    position = st.selectbox("Position", ["All Positions"] + list(position_options),
+    position = st.selectbox("Current Position", ["All Positions"] + list(position_options),
                             help="Similar positions are grouped across spelling, capitalization, &/and, punctuation, and numbered levels. Original employee positions are preserved.")
 
 with c_target:
@@ -2171,6 +2281,21 @@ def format_contract_date(value):
 
 
 display_df["End of Contract"] = display_df["End of Contract"].map(format_contract_date)
+def format_personnel_name(value):
+    """Uppercase surname, title-case given names; preserve missing names."""
+    import re
+    if pd.isna(value) or not str(value).strip() or str(value).strip() == "—":
+        return "—"
+    name = re.sub(r"\s+", " ", str(value)).strip()
+    if "," not in name:
+        return name.title()
+    surname, given = name.split(",", 1)
+    return f"{surname.strip().upper()}, {given.strip().title()}" if given.strip() else surname.strip().upper()
+
+
+display_df["Name"] = display_df["Name"].map(format_personnel_name)
+
+display_df = display_df.rename(columns={"Position": "Current Position"})
 display_df = display_df.sort_values("Name", kind="stable")
 
 r1, r2 = st.columns([4, 1.25])
@@ -2265,32 +2390,41 @@ def cv_export_dialog():
             mime="application/pdf", use_container_width=True,
         )
     else:
-        # Changing project selection invalidates any ZIP prepared for another project.
-        zip_key = f"{export_label}|{'|'.join(export_rows['Name'].astype(str))}"
-        if st.button("Prepare ZIP with CVs", use_container_width=True):
-            with st.spinner("Preparing private CV files..."):
-                try:
-                    archive, included, missing = cv_zip_export(
-                        pdf_bytes, export_rows["Name"].tolist(), metadata
-                    )
-                    st.session_state["cv_export_zip"] = archive
-                    st.session_state["cv_export_zip_key"] = zip_key
-                    st.session_state["cv_export_counts"] = (len(included), len(missing))
-                except Exception as exc:
-                    st.error(f"Unable to prepare CV export: {exc}")
-        if (st.session_state.get("cv_export_zip") and
-                st.session_state.get("cv_export_zip_key") == zip_key):
-            n, m = st.session_state.get("cv_export_counts", (0, 0))
-            st.caption(f"{n} CV(s) included; {m} missing/unavailable.")
-            st.download_button(
-                "Download PDF + CVs ZIP", st.session_state["cv_export_zip"],
-                f"OCP_Personnel_{safe_project}_CVs.zip", mime="application/zip",
-                use_container_width=True,
-            )
+        active_id = st.session_state.get("cv_background_job_id")
+        registry = _cv_job_registry()
+        with registry["lock"]:
+            active_job = registry["jobs"].get(active_id, {}) if active_id else {}
+        if active_job.get("status") in {"running", "ready"}:
+            st.info("CV export is being prepared or is ready. Check the CV Extraction Status below the export button.")
+        elif st.button("Prepare ZIP with CVs", use_container_width=True):
+            try:
+                url, key = _read_supabase_secrets()
+                if not url or not key:
+                    raise ValueError("Supabase configuration is missing")
+                job_id = uuid.uuid4().hex
+                filename = f"OCP_Personnel_{safe_project}_CVs.zip"
+                with registry["lock"]:
+                    registry["jobs"][job_id] = {
+                        "status": "running", "total": 0, "completed": 0,
+                        "included": 0, "missing": 0, "filename": filename,
+                    }
+                st.session_state["cv_background_job_id"] = job_id
+                worker = threading.Thread(
+                    target=_run_cv_export_job,
+                    args=(job_id, url, key, pdf_bytes, export_rows["Name"].tolist(), dict(metadata)),
+                    daemon=True,
+                )
+                worker.start()
+                st.info("CV extraction started. You can close this modal and monitor progress below the export button.")
+            except Exception as exc:
+                st.error(f"Unable to start CV extraction: {exc}")
 
 if st.session_state.pop("open_cv_export", False):
     st.session_state.pop("cv_export_zip", None)
     cv_export_dialog()
+
+# Status stays on the main page, directly below Download Filtered PDF.
+show_cv_export_status()
 
 # Display the employee name as the CV link, without a separate CV column.
 # Render an HTML table so linked and unlinked names can share the same column.
@@ -2319,7 +2453,7 @@ cv_urls = st.session_state["cv_once_urls"]
 
 # Compact widths preserve all personnel columns on a standard desktop screen.
 column_widths = {
-    "Name": "16%", "Position": "16%", "Current Project": "8%",
+    "Name": "16%", "Current Position": "16%", "Current Project": "8%",
     "Eligibility": "10%", "Sector": "8%", "Funding": "6%", "Total Year Experience": "9%",
     "Overseas Experience": "9%", "Evaluation": "10%", "End of Contract": "8%",
 }
