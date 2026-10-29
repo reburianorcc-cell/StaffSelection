@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from supabase import create_client, Client
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
@@ -1697,8 +1697,24 @@ def make_pdf(df, funding, position, evaluations, current_project, group_by_proje
                   f"<b>Evaluation:</b> {escape(', '.join(evaluations) or 'All')} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
                   styles["BodyText"]), Spacer(1, 12)
     ]
-    cols = ["Name", "Current Position", "Current Project", "Eligibility", "Sector", "Funding", "Total Year Experience", "Overseas Experience", "Evaluation", "End of Contract"]
-    widths = [86, 94, 64, 75, 57, 44, 59, 59, 76, 69]
+    cols = ["Name", "Current Position", "Current Project", "Eligibility", "Sector", "Funding", "Experience", "Overseas", "Evaluation", "Contract Duration"]
+    # Fit the full printable width of landscape A4; give long headings room.
+    widths = [105, 95, 83, 66, 53, 56, 76, 76, 79, 96]
+    header_style = ParagraphStyle(
+        "PersonnelPDFHeader", parent=styles["BodyText"],
+        fontName="Helvetica-Bold", fontSize=7.3, leading=9,
+        splitLongWords=0, spaceBefore=0, spaceAfter=0,
+    )
+    cell_style = ParagraphStyle(
+        "PersonnelPDFCell", parent=styles["BodyText"],
+        fontSize=7.1, leading=9, splitLongWords=0,
+        spaceBefore=0, spaceAfter=0,
+    )
+    header_labels = [
+        "Name", "Current<br/>Position", "Current<br/>Project", "Eligibility",
+        "Sector", "Funding", "Experience",
+        "Overseas", "Evaluation", "Personnel<br/>Contract",
+    ]
     if group_by_project:
         pdf_groups = project_grouped_rows(df)
     else:
@@ -1707,16 +1723,16 @@ def make_pdf(df, funding, position, evaluations, current_project, group_by_proje
         if project is not None:
             story.append(Paragraph(f"{escape(project)} — {len(group):,} employee(s)", styles["Heading3"]))
             story.append(Spacer(1, 5))
-        data = [[Paragraph(f"<b>{escape(c)}</b>", styles["BodyText"]) for c in cols]]
+        data = [[Paragraph(label, header_style) for label in header_labels]]
         for _, record in group.iterrows():
-            data.append([Paragraph(escape(str(record.get(c, "") if pd.notna(record.get(c, "")) else "")), styles["BodyText"]) for c in cols])
+            data.append([Paragraph(escape(str(record.get(c, "") if pd.notna(record.get(c, "")) else "")), cell_style) for c in cols])
         table = Table(data, repeatRows=1, colWidths=widths, hAlign="LEFT")
         table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E9EEF5")),
             ("GRID", (0, 0), (-1, -1), .35, colors.HexColor("#D5DAE3")),
             ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 5),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 4),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 4),
             ("TOPPADDING", (0, 0), (-1, -1), 5),
             ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
         ]))
@@ -2266,7 +2282,7 @@ if selected_projects:
 
 display_df = filtered[["Name", "Position", "Project", "Eligibility", "Sector", "Funding Display", "Experience", "Overseas Experience", "Evaluation Display", "End of Contract"]].copy()
 display_df = display_df.rename(columns={
-    "Project": "Current Project", "Funding Display": "Funding", "Experience": "Total Year Experience", "Evaluation Display": "Evaluation"
+    "Project": "Current Project", "Funding Display": "Funding", "Experience": "Experience", "Overseas Experience": "Overseas", "Evaluation Display": "Evaluation"
 })
 for col in display_df.columns:
     display_df[col] = display_df[col].replace({"": "—", "nan": "—", "None": "—"})
@@ -2277,10 +2293,18 @@ def format_contract_date(value):
     parsed = pd.to_datetime(value, errors="coerce")
     if pd.isna(parsed):
         return "—"
-    return f"{parsed.strftime('%B')} {parsed.day}, {parsed.year}"
+    return parsed.strftime("%m/%d/%Y")
 
+
+# Shorten the evaluation value in the personnel table and exported PDF only.
+# Keep the underlying evaluation values and dropdown options unchanged.
+display_df["Evaluation"] = display_df["Evaluation"].replace({
+    "Exceed Requirements": "Exceeds",
+    "Exceeds Requirements": "Exceeds",
+})
 
 display_df["End of Contract"] = display_df["End of Contract"].map(format_contract_date)
+display_df = display_df.rename(columns={"End of Contract": "Contract Duration"})
 def format_personnel_name(value):
     """Uppercase surname, title-case given names; preserve missing names."""
     import re
@@ -2325,15 +2349,15 @@ def cv_export_dialog():
     selected_export_projects = st.multiselect(
         "Select projects to print / download",
         options=project_names,
-        default=[],
-        placeholder="All Projects (no project grouping)",
-        key="cv_export_project_choices",
-        help="Select two or more projects. Leave empty to include all filtered employees in one alphabetical table without project sections.",
+        default=[p for p in selected_projects if p in project_names],
+        placeholder="All Filtered Projects (no project grouping)",
+        key="cv_export_project_choices_" + str(abs(hash(tuple(sorted(selected_projects))))),
+        help="Defaults to the Current Project filter on the dashboard. Clear selection to include all currently filtered employees.",
     )
     all_projects_mode = not selected_export_projects
     if all_projects_mode:
         export_rows = all_rows.copy()
-        st.caption("All Projects · no project grouping · employees sorted alphabetically")
+        st.caption("All currently filtered projects · no project grouping · employees sorted alphabetically")
     else:
         export_rows = all_rows[all_rows["Current Project"].isin(selected_export_projects)].copy()
         st.caption(f"{len(selected_export_projects)} project(s) selected")
@@ -2376,14 +2400,14 @@ def cv_export_dialog():
         key="export_include_matching_cvs",
     )
 
-    export_label = "All Projects" if all_projects_mode else ", ".join(selected_export_projects)
+    export_label = current_project if all_projects_mode else ", ".join(selected_export_projects)
     pdf_bytes = make_pdf(
         export_rows, funding, position, evaluations,
         export_label, group_by_project=not all_projects_mode,
     )
-    safe_project = "All_Projects" if all_projects_mode else "_".join(
+    safe_project = (re.sub(r"[^A-Za-z0-9_-]+", "_", current_project).strip("_")[:110] if all_projects_mode else "_".join(
         re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") for name in selected_export_projects
-    )[:110]
+    )[:110])
     if not include_cvs:
         st.download_button(
             "Download Personnel PDF", pdf_bytes, f"OCP_Personnel_{safe_project}.pdf",
@@ -2454,8 +2478,8 @@ cv_urls = st.session_state["cv_once_urls"]
 # Compact widths preserve all personnel columns on a standard desktop screen.
 column_widths = {
     "Name": "16%", "Current Position": "16%", "Current Project": "8%",
-    "Eligibility": "10%", "Sector": "8%", "Funding": "6%", "Total Year Experience": "9%",
-    "Overseas Experience": "9%", "Evaluation": "10%", "End of Contract": "8%",
+    "Eligibility": "10%", "Sector": "8%", "Funding": "6%", "Experience": "9%",
+    "Overseas": "9%", "Evaluation": "10%", "Contract Duration": "8%",
 }
 visible_cols = list(table_df.columns)
 headers = "".join(
@@ -2482,9 +2506,10 @@ for _, record in table_df.iterrows():
 
 st.markdown(
     """<style>
-    .ocp-staff-scroll {max-height:565px;overflow-y:auto;overflow-x:auto;border:1px solid #dfe6ee;border-radius:12px;background:white;}
+    .ocp-staff-scroll {position:relative;isolation:isolate;contain:paint;max-height:565px;overflow:auto;border:1px solid #dfe6ee;border-radius:12px;background:#fff;overscroll-behavior:contain;}
     .ocp-staff-table {width:100%;table-layout:fixed;border-collapse:collapse;font-family:Inter,Arial,sans-serif;font-size:12px;color:#26344c;}
-    .ocp-staff-table th {position:sticky;top:0;background:#f7f9fc;z-index:1;color:#728198;font-weight:500;text-align:left;}
+    .ocp-staff-table thead {position:sticky;top:0;z-index:10;background:#f7f9fc;}
+    .ocp-staff-table th {position:sticky;top:0;z-index:11;background:#f7f9fc !important;box-shadow:0 1px 0 #dfe6ee;color:#728198;font-weight:500;text-align:left;}
     .ocp-staff-table td,.ocp-staff-table th {padding:10px 7px;border-bottom:1px solid #e4e9ef;vertical-align:middle;overflow-wrap:anywhere;}
     .ocp-staff-table a {color:#1163bd;text-decoration:none;font-weight:500;}
     .ocp-staff-table a:hover {text-decoration:underline;}
