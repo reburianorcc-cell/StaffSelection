@@ -30,6 +30,17 @@ def get_supabase_client() -> Client:
     return create_client(url, key)
 st.set_page_config(page_title="Oriental Consultants Philippines Inc.", page_icon="OCP", layout="wide")
 
+# Best-effort hiding of Streamlit's built-in footer and toolbar.
+# Community Cloud's external hosting badge may not be affected.
+st.markdown("""
+<style>
+footer { visibility: hidden !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
+[data-testid="stToolbar"] { visibility: hidden !important; }
+</style>
+""", unsafe_allow_html=True)
+
+
 def _logo_data_uri():
     logo_path = Path(__file__).resolve().parent / "oc_philippines_logo.png"
     try:
@@ -2312,7 +2323,12 @@ def format_personnel_name(value):
         return "—"
     name = re.sub(r"\s+", " ", str(value)).strip()
     if "," not in name:
-        return name.title()
+        # Legacy records sometimes use surname-first names without a comma.
+        # Example: "Bantola Aizel P." -> "BANTOLA, Aizel P."
+        parts = name.split(" ", 1)
+        if len(parts) == 1:
+            return parts[0].upper()
+        return f"{parts[0].upper()}, {parts[1].title()}"
     surname, given = name.split(",", 1)
     return f"{surname.strip().upper()}, {given.strip().title()}" if given.strip() else surname.strip().upper()
 
