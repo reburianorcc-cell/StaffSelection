@@ -1699,7 +1699,7 @@ def make_pdf(df, funding, position, evaluations, current_project, group_by_proje
     ]
     cols = ["Name", "Current Position", "Current Project", "Eligibility", "Sector", "Funding", "Experience", "Overseas", "Evaluation", "Contract Duration"]
     # Fit the full printable width of landscape A4; give long headings room.
-    widths = [105, 95, 83, 66, 53, 56, 76, 76, 79, 96]
+    widths = [123, 113, 83, 66, 53, 56, 58, 58, 79, 96]
     header_style = ParagraphStyle(
         "PersonnelPDFHeader", parent=styles["BodyText"],
         fontName="Helvetica-Bold", fontSize=7.3, leading=9,
@@ -1713,7 +1713,7 @@ def make_pdf(df, funding, position, evaluations, current_project, group_by_proje
     header_labels = [
         "Name", "Current<br/>Position", "Current<br/>Project", "Eligibility",
         "Sector", "Funding", "Experience",
-        "Overseas", "Evaluation", "Personnel<br/>Contract",
+        "Overseas", "Evaluation", "Contract Duration<br/>MM/DD/YYYY",
     ]
     if group_by_project:
         pdf_groups = project_grouped_rows(df)
@@ -2477,13 +2477,16 @@ cv_urls = st.session_state["cv_once_urls"]
 
 # Compact widths preserve all personnel columns on a standard desktop screen.
 column_widths = {
-    "Name": "16%", "Current Position": "16%", "Current Project": "8%",
-    "Eligibility": "10%", "Sector": "8%", "Funding": "6%", "Experience": "9%",
-    "Overseas": "9%", "Evaluation": "10%", "Contract Duration": "8%",
+    "Name": "19%", "Current Position": "19%", "Current Project": "8%",
+    "Eligibility": "9%", "Sector": "7%", "Funding": "6%", "Experience": "7%",
+    "Overseas": "7%", "Evaluation": "9%", "Contract Duration": "9%",
 }
 visible_cols = list(table_df.columns)
 headers = "".join(
-    f'<th style="width:{column_widths.get(c, "auto")}">{html_escape(str(c))}</th>'
+    f'<th style="width:{column_widths.get(c, "auto")}">'
+    + ('<span class="contract-heading">Contract Duration</span><span class="contract-date-format">MM/DD/YYYY</span>'
+       if c == "Contract Duration" else html_escape(str(c)))
+    + '</th>'
     for c in visible_cols
 )
 rows_html = []
@@ -2511,6 +2514,8 @@ st.markdown(
     .ocp-staff-table thead {position:sticky;top:0;z-index:10;background:#f7f9fc;}
     .ocp-staff-table th {position:sticky;top:0;z-index:11;background:#f7f9fc !important;box-shadow:0 1px 0 #dfe6ee;color:#728198;font-weight:500;text-align:left;}
     .ocp-staff-table td,.ocp-staff-table th {padding:10px 7px;border-bottom:1px solid #e4e9ef;vertical-align:middle;overflow-wrap:anywhere;}
+    .ocp-staff-table .contract-heading,.ocp-staff-table .contract-date-format {display:block;}
+    .ocp-staff-table .contract-date-format {font-size:10px;font-weight:400;color:#8290a4;margin-top:3px;white-space:nowrap;}
     .ocp-staff-table a {color:#1163bd;text-decoration:none;font-weight:500;}
     .ocp-staff-table a:hover {text-decoration:underline;}
     .ocp-staff-table tr:hover td {background:#f7faff;}
