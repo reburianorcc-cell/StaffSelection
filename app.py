@@ -104,6 +104,57 @@ div[data-testid="stTextInput"] [data-baseweb="input"] {
 }
 div[data-testid="stDataFrame"] {border-radius:14px;overflow:hidden;border:1px solid #e3e9f0;background:#fff;}
 
+/* Filter controls: preserve the screenshot's 4 + 3 grid even with many selections. */
+.st-key-target_position_filter,
+.st-key-current_project_multiselect,
+div[data-testid="stMultiSelect"] {
+    min-width:0 !important;
+    width:100% !important;
+}
+/* A fixed-height selection box; chips must never wrap to a second line. */
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div {
+    height:49px !important;
+    min-height:49px !important;
+    max-height:49px !important;
+    width:100% !important;
+    min-width:0 !important;
+    flex-wrap:nowrap !important;
+    overflow:hidden !important;
+    box-sizing:border-box !important;
+    align-items:center !important;
+    background:#f0f3f7 !important;
+    border-radius:10px !important;
+}
+/* Horizontal chip rail, with controls kept fixed on the right. */
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div > div:first-child {
+    display:flex !important;
+    flex:1 1 auto !important;
+    flex-wrap:nowrap !important;
+    min-width:0 !important;
+    max-width:100% !important;
+    overflow-x:auto !important;
+    overflow-y:hidden !important;
+    scrollbar-width:none;
+    align-items:center !important;
+}
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div > div:first-child::-webkit-scrollbar {display:none;}
+div[data-testid="stMultiSelect"] [data-baseweb="select"] > div > div:last-child {
+    flex:0 0 auto !important;
+    margin-left:auto !important;
+}
+div[data-testid="stMultiSelect"] [data-baseweb="tag"] {
+    flex:0 0 auto !important;
+    max-width:180px !important;
+    white-space:nowrap !important;
+}
+/* Let filter columns shrink instead of forcing the grid wider. */
+div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {min-width:0 !important;}
+/* Experience checkboxes should not cause the row to grow. */
+.st-key-experience_filter_panel div[data-testid="stHorizontalBlock"] {align-items:center !important;}
+.st-key-experience_filter_panel div[data-testid="stCheckbox"] label {
+    white-space:nowrap !important;
+    font-size:12px !important;
+}
 /* Compact, aligned inline experience controls; no dropdown. */
 .experience-filter-heading {font-size:14px;color:#092e50;margin:0 0 6px;line-height:1.4;}
 div[data-testid="stCheckbox"] label {font-size:13px !important;}
@@ -1692,7 +1743,7 @@ def project_grouped_rows(df):
             for project, group in result.groupby("Current Project", sort=False)]
 
 
-def make_pdf(df, funding, position, evaluations, current_project, group_by_project=True):
+def make_pdf(df, funding, position, evaluations, current_project, group_by_project=True, target_positions=None):
     """Export filtered staff in a single PDF, separated and sorted by current project."""
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
@@ -1703,14 +1754,15 @@ def make_pdf(df, funding, position, evaluations, current_project, group_by_proje
         Paragraph("Oriental Consultants Philippines Inc.", styles["Title"]),
         Paragraph("Personnel List by Current Project" if group_by_project else "Personnel List", styles["Heading2"]), Spacer(1, 8),
         Paragraph(f"<b>Selected Project(s):</b> {escape(str(current_project))}", styles["BodyText"]),
+        Paragraph(f"<b>Target Position:</b> {escape(', '.join(target_positions or []) or 'All Target Positions')}", styles["BodyText"]),
         Spacer(1, 5),
         Paragraph(f"<b>Funding:</b> {escape(str(funding))} &nbsp; | &nbsp; <b>Current Position:</b> {escape(str(position))} &nbsp; | &nbsp; "
                   f"<b>Evaluation:</b> {escape(', '.join(evaluations) or 'All')} &nbsp; | &nbsp; <b>Total:</b> {len(df):,}",
                   styles["BodyText"]), Spacer(1, 12)
     ]
-    cols = ["Name", "Current Position", "Current Project", "Eligibility", "Sector", "Funding", "Experience", "Overseas", "Evaluation", "Contract Duration"]
+    cols = ["Name", "Current Position", "Current Project", "Eligibility", "Sector", "Funding", "Experience", "Overseas", "Evaluation", "Contract Duration", "Expected Project Completion"]
     # Fit the full printable width of landscape A4; give long headings room.
-    widths = [123, 113, 83, 66, 53, 56, 58, 58, 79, 96]
+    widths = [106, 103, 74, 59, 48, 50, 54, 53, 67, 83, 85]
     header_style = ParagraphStyle(
         "PersonnelPDFHeader", parent=styles["BodyText"],
         fontName="Helvetica-Bold", fontSize=7.3, leading=9,
@@ -1724,7 +1776,7 @@ def make_pdf(df, funding, position, evaluations, current_project, group_by_proje
     header_labels = [
         "Name", "Current<br/>Position", "Current<br/>Project", "Eligibility",
         "Sector", "Funding", "Experience",
-        "Overseas", "Evaluation", "Contract Duration<br/>MM/DD/YYYY",
+        "Overseas", "Evaluation", "Contract Duration<br/>MM/DD/YYYY", "Expected Project<br/>Completion<br/>(Year)",
     ]
     if group_by_project:
         pdf_groups = project_grouped_rows(df)
@@ -2129,7 +2181,7 @@ def target_position_matches(position_text, target):
         return contains(r"\b(account(?:ant|ants|ing|s)?|bookkeep(?:er|ing)|finance|financial|payroll|auditor|audit|taxation|tax|treasury|billing|accounts payable|accounts receivable)\b")
     return False
 
-c1, c2, c3, c_target = st.columns([1.0, 1.05, 1.05, 1.3], gap="small")
+c1, c2, c3, c_target = st.columns([1, 1, 1, 1], gap="small")
 with c1:
     funding_options = sorted(x for x in filtered["Funding Display"].unique() if x)
     funding = st.selectbox("Funding", ["All Funding"] + funding_options)
@@ -2206,13 +2258,13 @@ with c_target:
         key="target_position_filter",
     )
 
-c4, c5, c6 = st.columns(3)
+c4, c5, c6 = st.columns([1.25, 1, 1], gap="small")
 with c4:
     st.markdown("<div class='experience-filter-heading'>Years of Experience</div>", unsafe_allow_html=True)
     # All controls share one compact row. Sliders render in a floating popover,
     # so toggling either option never increases the filter row height.
     with st.container(key="experience_filter_panel"):
-        settings_col, total_col, overseas_col = st.columns([1.45, 1.1, 1.25], gap="small", vertical_alignment="center")
+        settings_col, total_col, overseas_col = st.columns([1.25, 1.05, 1.15], gap="small", vertical_alignment="center")
         with settings_col:
             with st.popover("Years of Experience", use_container_width=True):
                 st.markdown("<span class='ocp-experience-popover-marker'></span>", unsafe_allow_html=True)
@@ -2291,6 +2343,27 @@ if evaluations:
 if selected_projects:
     filtered = filtered[filtered["Project"].isin(selected_projects)]
 
+# Project completion dates are shared by all personnel on the same project.
+# Keep this lookup in the session to avoid a database request on filter changes.
+if "project_completion_once" not in st.session_state:
+    # Seeded project years are displayed immediately, including before SQL setup.
+    completion_years = {"nscrex": 2030, "mrt-3": 2028, "mmsp": 2028}
+    try:
+        project_client = get_supabase_client()
+        if project_client is not None:
+            project_rows = project_client.table("projects").select(
+                "project_name,expected_completion_year"
+            ).execute().data or []
+            for row in project_rows:
+                project_name = str(row.get("project_name") or "").strip().casefold()
+                year = row.get("expected_completion_year")
+                if project_name and year is not None:
+                    completion_years[project_name] = int(year)
+    except Exception:
+        # Database setup may not have been run yet; seeded years remain visible.
+        pass
+    st.session_state["project_completion_once"] = completion_years
+
 display_df = filtered[["Name", "Position", "Project", "Eligibility", "Sector", "Funding Display", "Experience", "Overseas Experience", "Evaluation Display", "End of Contract"]].copy()
 display_df = display_df.rename(columns={
     "Project": "Current Project", "Funding Display": "Funding", "Experience": "Experience", "Overseas Experience": "Overseas", "Evaluation Display": "Evaluation"
@@ -2316,6 +2389,12 @@ display_df["Evaluation"] = display_df["Evaluation"].replace({
 
 display_df["End of Contract"] = display_df["End of Contract"].map(format_contract_date)
 display_df = display_df.rename(columns={"End of Contract": "Contract Duration"})
+display_df["Expected Project Completion"] = display_df["Current Project"].map(
+    lambda project: str(st.session_state["project_completion_once"].get(
+        str(project).strip().casefold(), "—"
+    ))
+)
+
 def format_personnel_name(value):
     """Uppercase surname, title-case given names; preserve missing names."""
     import re
@@ -2352,7 +2431,7 @@ with r1:
     )
 with r2:
     if not filtered.empty:
-        pdf = make_pdf(display_df, funding, position, evaluations, current_project)
+        pdf = make_pdf(display_df, funding, position, evaluations, current_project, target_positions=target_positions)
         if st.button("Download Filtered PDF", use_container_width=True, key="export_filtered_staff"):
             st.session_state["open_cv_export"] = True
 
@@ -2379,6 +2458,7 @@ def cv_export_dialog():
         st.caption(f"{len(selected_export_projects)} project(s) selected")
     export_rows = export_rows.sort_values("Name", kind="stable").reset_index(drop=True)
     st.write(f"**{len(export_rows):,} employee(s) selected**")
+    st.caption("Target Position: " + (", ".join(target_positions) if target_positions else "All Target Positions"))
 
     if all_projects_mode:
         # All Projects is a single ungrouped alphabetical table.
@@ -2419,7 +2499,7 @@ def cv_export_dialog():
     export_label = current_project if all_projects_mode else ", ".join(selected_export_projects)
     pdf_bytes = make_pdf(
         export_rows, funding, position, evaluations,
-        export_label, group_by_project=not all_projects_mode,
+        export_label, group_by_project=not all_projects_mode, target_positions=target_positions,
     )
     safe_project = (re.sub(r"[^A-Za-z0-9_-]+", "_", current_project).strip("_")[:110] if all_projects_mode else "_".join(
         re.sub(r"[^A-Za-z0-9_-]+", "_", name).strip("_") for name in selected_export_projects
@@ -2480,28 +2560,36 @@ if "cv_once_metadata" not in st.session_state:
             st.session_state["cv_once_metadata"] = cv_metadata_for_names(all_names)
         except Exception:
             st.session_state["cv_once_metadata"] = {}
+# Only sign CVs for personnel in the filtered table; reuse links on future
+# filter changes. This avoids signing every CV during the initial page load.
 if "cv_once_urls" not in st.session_state:
-    with st.spinner("Preparing CV links once..."):
-        links = {}
-        for key, item in st.session_state["cv_once_metadata"].items():
-            try:
-                links[key] = cv_signed_link(item["storage_path"])
-            except Exception:
-                continue
-        st.session_state["cv_once_urls"] = links
+    st.session_state["cv_once_urls"] = {}
 cv_urls = st.session_state["cv_once_urls"]
+visible_name_keys = {
+    cv_name_key(name) for name in table_df["Name"].dropna().astype(str)
+} if "Name" in table_df.columns else set()
+for name_key in visible_name_keys:
+    if name_key in cv_urls:
+        continue
+    cv_item = st.session_state["cv_once_metadata"].get(name_key)
+    if not cv_item:
+        continue
+    try:
+        cv_urls[name_key] = cv_signed_link(cv_item["storage_path"])
+    except Exception:
+        continue
 
 # Compact widths preserve all personnel columns on a standard desktop screen.
 column_widths = {
-    "Name": "19%", "Current Position": "19%", "Current Project": "8%",
-    "Eligibility": "9%", "Sector": "7%", "Funding": "6%", "Experience": "7%",
-    "Overseas": "7%", "Evaluation": "9%", "Contract Duration": "9%",
+    "Name": "16%", "Current Position": "16%", "Current Project": "8%",
+    "Eligibility": "8%", "Sector": "7%", "Funding": "6%", "Experience": "6%",
+    "Overseas": "6%", "Evaluation": "8%", "Contract Duration": "9%", "Expected Project Completion": "10%",
 }
 visible_cols = list(table_df.columns)
 headers = "".join(
     f'<th style="width:{column_widths.get(c, "auto")}">'
     + ('<span class="contract-heading">Contract Duration</span><span class="contract-date-format">MM/DD/YYYY</span>'
-       if c == "Contract Duration" else html_escape(str(c)))
+       if c == "Contract Duration" else ("Expected Project Completion<br/><small>Year</small>" if c == "Expected Project Completion" else html_escape(str(c))))
     + '</th>'
     for c in visible_cols
 )
