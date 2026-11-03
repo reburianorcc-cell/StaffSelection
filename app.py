@@ -22,6 +22,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 
+@st.cache_resource(show_spinner=False)
 def get_supabase_client() -> Client:
     """Initialize and return the Supabase client."""
     url, key = _read_supabase_secrets()
@@ -803,7 +804,7 @@ def _read_supabase_secrets():
 
     return None, None
 
-def fetch_staff_from_supabase():
+def _fetch_staff_legacy():
     """Load the staff records currently stored in Supabase."""
     empty = pd.DataFrame(columns=[
         "Name", "Position", "Type of Engagement", "Evaluation", "Status", "Project",
@@ -911,6 +912,50 @@ def fetch_staff_from_supabase():
     except Exception as exc:
         st.session_state.supabase_error = str(exc)
         return empty
+
+
+@st.cache_data(show_spinner=False, ttl=300, max_entries=3)
+def fetch_staff_from_supabase():
+    """Fetch all required staff columns in a single paginated pass.
+
+    Fall back to the original optional-column-safe loader for older schemas.
+    """
+    client = get_supabase_client()
+    fields = (
+        "name,position,type_of_engagement,evaluation,status,project,funding,sector,"
+        "experience,overseas_experience,end_of_contract,eligibility,"
+        "source_file,source_path,uploaded_at"
+    )
+    try:
+        rows = []
+        offset = 0
+        while True:
+            batch = (client.table("staff_records")
+                     .select(fields).range(offset, offset + 999)
+                     .execute()).data or []
+            rows.extend(batch)
+            if len(batch) < 1000:
+                break
+            offset += 1000
+        if not rows:
+            return pd.DataFrame(columns=["Name", "Position", "Project"])
+        rename = {
+            "name": "Name", "position": "Position", "type_of_engagement": "Type of Engagement",
+            "evaluation": "Evaluation", "status": "Status", "project": "Project",
+            "funding": "Funding", "sector": "Sector", "experience": "Experience",
+            "overseas_experience": "Overseas Experience", "end_of_contract": "End of Contract",
+            "eligibility": "Eligibility", "source_file": "Source File",
+            "source_path": "Source Path", "uploaded_at": "Uploaded At",
+        }
+        return clean_staff(pd.DataFrame(rows).rename(columns=rename))
+    except Exception as exc:
+        # Only use compatibility queries for an outdated database schema.
+        # Network/time-out failures should not trigger 4+ more full-table requests.
+        message = str(exc).lower()
+        if any(token in message for token in ("does not exist", "could not find", "42703", "pgrst204", "pgrst200")):
+            return _fetch_staff_legacy()
+        raise RuntimeError(f"Unable to load personnel records from Supabase: {exc}") from exc
+
 
 
 # --- Private CV storage / employee-name matching ---
@@ -1092,7 +1137,7 @@ def cv_upload_batch(files):
         st.session_state.pop("cv_once_urls", None)
     return matched, unmatched, failed
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300, max_entries=10)
 def cv_metadata_for_names(names):
     """Return one CV per exact normalized employee name, without public URLs."""
     client = get_supabase_client()
@@ -1837,7 +1882,6 @@ if st.session_state.login_loading and not st.session_state.logged_in:
     </div>
     """, unsafe_allow_html=True)
 
-    time.sleep(1.15)
     st.session_state.logged_in = True
     st.session_state.login_loading = False
     st.rerun()
@@ -1986,6 +2030,7 @@ with _admin_col:
                                         f"{result['skipped_upload_duplicates']:,} duplicate row(s) inside the uploaded file were also skipped."
                                     )
                                 st.session_state.pop("personnel_once_df", None)
+                                fetch_staff_from_supabase.clear()
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Supabase upload failed: {e}")
@@ -2568,16 +2613,25 @@ cv_urls = st.session_state["cv_once_urls"]
 visible_name_keys = {
     cv_name_key(name) for name in table_df["Name"].dropna().astype(str)
 } if "Name" in table_df.columns else set()
-for name_key in visible_name_keys:
-    if name_key in cv_urls:
-        continue
-    cv_item = st.session_state["cv_once_metadata"].get(name_key)
-    if not cv_item:
-        continue
-    try:
-        cv_urls[name_key] = cv_signed_link(cv_item["storage_path"])
-    except Exception:
-        continue
+# Sign missing CV links concurrently; filters reuse previously signed URLs.
+missing_cv_paths = [
+    (key, st.session_state["cv_once_metadata"][key]["storage_path"])
+    for key in visible_name_keys
+    if key not in cv_urls and key in st.session_state["cv_once_metadata"]
+]
+if missing_cv_paths:
+    def _sign_cv_link(item):
+        key, path = item
+        return key, cv_signed_link(path)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for future in as_completed([pool.submit(_sign_cv_link, item) for item in missing_cv_paths]):
+            try:
+                key, url = future.result()
+                if url:
+                    cv_urls[key] = url
+            except Exception:
+                pass
 
 # Compact widths preserve all personnel columns on a standard desktop screen.
 column_widths = {
